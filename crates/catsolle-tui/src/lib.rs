@@ -442,6 +442,7 @@ struct ShellToolRequest {
     wait_ms: u64,
     timeout_ms: u64,
     max_bytes: usize,
+    marker: Option<String>,
     tx: oneshot::Sender<Result<ShellToolResponse, String>>,
 }
 
@@ -454,6 +455,7 @@ struct ShellToolResponse {
     truncated: bool,
     timed_out: bool,
     screen: String,
+    status: Option<i32>,
 }
 
 struct ShellCapture {
@@ -462,6 +464,9 @@ struct ShellCapture {
     wait_ms: u64,
     idle_deadline: Instant,
     hard_deadline: Instant,
+    marker: Option<String>,
+    marker_end: Option<u64>,
+    status: Option<i32>,
     tx: oneshot::Sender<Result<ShellToolResponse, String>>,
 }
 
@@ -709,7 +714,9 @@ impl AppState {
 
         let lines = self.assistant_lines();
         let visible = area.height.saturating_sub(2) as usize;
-        let max_scroll = lines.len().saturating_sub(visible);
+        let inner_width = area.width.saturating_sub(2).max(1);
+        let total_wrapped = wrapped_line_count(&lines, inner_width);
+        let max_scroll = total_wrapped.saturating_sub(visible);
         if self.assistant.scroll > max_scroll {
             self.assistant.scroll = max_scroll;
         }
@@ -1305,11 +1312,17 @@ impl AppState {
 
             lines.push(Line::from(Span::styled(format!("{label}:"), label_style)));
 
+            let content = if matches!(message.role, AssistantRole::Tool) {
+                tool_display_text(&message.content)
+            } else {
+                message.content.clone()
+            };
+
             if use_markdown {
-                let md_lines = render_markdown_lines(&message.content, theme, text_style);
+                let md_lines = render_markdown_lines(&content, theme, text_style);
                 lines.extend(md_lines);
             } else {
-                for line in message.content.lines() {
+                for line in content.lines() {
                     lines.push(Line::from(Span::styled(line.to_string(), text_style)));
                 }
             }
@@ -1362,17 +1375,53 @@ impl AppState {
                 capture.idle_deadline = Instant::now() + Duration::from_millis(capture.wait_ms);
             }
         }
+        self.update_shell_capture_marker();
         self.finish_shell_capture(false);
     }
 
     fn shell_capture_deadline(&self) -> Option<Instant> {
         self.shell_capture.as_ref().map(|capture| {
-            if capture.idle_deadline < capture.hard_deadline {
+            if capture.marker.is_some() {
+                capture.hard_deadline
+            } else if capture.idle_deadline < capture.hard_deadline {
                 capture.idle_deadline
             } else {
                 capture.hard_deadline
             }
         })
+    }
+
+    fn update_shell_capture_marker(&mut self) {
+        let (start_offset, marker) = match self.shell_capture.as_ref() {
+            Some(capture) => {
+                if capture.marker_end.is_some() {
+                    return;
+                }
+                let Some(marker) = capture.marker.as_ref() else {
+                    return;
+                };
+                (capture.start_offset, marker.clone())
+            }
+            None => return,
+        };
+        let Some((end_offset, status)) = self.find_shell_marker(start_offset, &marker) else {
+            return;
+        };
+        if let Some(capture) = self.shell_capture.as_mut() {
+            capture.marker_end = Some(end_offset);
+            capture.status = Some(status);
+        }
+    }
+
+    fn find_shell_marker(&self, start_offset: u64, marker: &str) -> Option<(u64, i32)> {
+        let available = self.shell_log.end_offset().saturating_sub(start_offset) as usize;
+        if available == 0 {
+            return None;
+        }
+        let slice = self.shell_log.read_from(start_offset, available);
+        let (_, end_idx, status) = find_shell_marker_in_bytes(&slice.bytes, marker)?;
+        let end_offset = slice.start_offset + end_idx as u64;
+        Some((end_offset, status))
     }
 
     async fn handle_shell_tool_request(&mut self, req: ShellToolRequest) {
@@ -1391,7 +1440,11 @@ impl AppState {
             input.push('\n');
         }
         let wait_ms = req.wait_ms.min(SHELL_MAX_WAIT_MS);
-        let timeout_ms = req.timeout_ms.min(SHELL_MAX_TIMEOUT_MS).max(wait_ms);
+        let timeout_ms = if req.timeout_ms == 0 {
+            SHELL_MAX_TIMEOUT_MS.max(wait_ms)
+        } else {
+            req.timeout_ms.min(SHELL_MAX_TIMEOUT_MS).max(wait_ms)
+        };
         let max_bytes = req.max_bytes.clamp(1, SHELL_LOG_MAX_BYTES);
         let start_offset = self.shell_log.end_offset();
         if let Err(err) = shell.write(input.as_bytes()).await {
@@ -1408,6 +1461,9 @@ impl AppState {
             wait_ms,
             idle_deadline,
             hard_deadline,
+            marker: req.marker,
+            marker_end: None,
+            status: None,
             tx: req.tx,
         });
         info!(
@@ -1422,23 +1478,39 @@ impl AppState {
         let Some(capture) = self.shell_capture.as_ref() else {
             return;
         };
-        let slice = self
-            .shell_log
-            .read_from(capture.start_offset, capture.max_bytes);
-        let should_finish = force || slice.bytes.len() >= capture.max_bytes;
+        let slice = self.shell_capture_slice(capture);
+        let marker_active = capture.marker.is_some();
+        let marker_done = capture.marker_end.is_some();
+        let should_finish =
+            marker_done || force || (!marker_active && slice.bytes.len() >= capture.max_bytes);
         if !should_finish {
             return;
         }
         let capture = self.shell_capture.take().unwrap();
-        let timed_out = force && Instant::now() >= capture.hard_deadline;
-        let response = self.build_shell_response(slice, timed_out);
+        let timed_out = !marker_done && force && Instant::now() >= capture.hard_deadline;
+        let response = self.build_shell_response(slice, timed_out, capture.status);
         let _ = capture.tx.send(Ok(response));
     }
 
-    fn build_shell_response(&self, slice: ShellLogSlice, timed_out: bool) -> ShellToolResponse {
+    fn shell_capture_slice(&self, capture: &ShellCapture) -> ShellLogSlice {
+        let mut max_bytes = capture.max_bytes;
+        if let Some(end_offset) = capture.marker_end {
+            let target = end_offset.saturating_sub(capture.start_offset) as usize;
+            max_bytes = max_bytes.min(target.max(1));
+        }
+        self.shell_log.read_from(capture.start_offset, max_bytes)
+    }
+
+    fn build_shell_response(
+        &self,
+        slice: ShellLogSlice,
+        timed_out: bool,
+        status: Option<i32>,
+    ) -> ShellToolResponse {
         let raw = String::from_utf8_lossy(&slice.bytes).to_string();
-        let trimmed = trim_output(&raw);
-        let truncated = slice.truncated || trimmed.len() < raw.len();
+        let cleaned = clean_shell_output(&raw);
+        let trimmed = trim_output(&cleaned);
+        let truncated = slice.truncated || trimmed.len() < cleaned.len();
         ShellToolResponse {
             output: trimmed,
             bytes: slice.bytes.len(),
@@ -1448,6 +1520,7 @@ impl AppState {
             truncated,
             timed_out,
             screen: self.get_terminal_context(SHELL_SCREEN_LINES),
+            status,
         }
     }
 
@@ -2497,7 +2570,7 @@ impl AppState {
                         let mut args = FluentArgs::new();
                         args.set("name", skipped.name);
                         self.set_status(self.i18n.tr_args("ai-tool-skipped", &args));
-                        if self.config.ai.auto_mode {
+                        if self.config.ai.auto_mode || self.config.ai.agent_enabled {
                             self.start_next_tool();
                         }
                     }
@@ -2664,7 +2737,11 @@ impl AppState {
         );
         let messages = self.build_ai_request_messages();
         if self.config.ai.agent_enabled {
-            self.agent_steps_remaining = self.config.ai.max_steps;
+            self.agent_steps_remaining = if self.config.ai.max_steps == 0 {
+                u32::MAX
+            } else {
+                self.config.ai.max_steps
+            };
         } else {
             self.agent_steps_remaining = 0;
         }
@@ -2801,7 +2878,9 @@ impl AppState {
         prompt.push_str("- Be concise but helpful\n");
         prompt.push_str("- Suggest exact commands when relevant\n");
         prompt.push_str("- Warn about destructive operations\n");
-        prompt.push_str("- Use remote.shell.exec for interactive shell commands\n");
+        prompt.push_str(
+            "- Prefer remote.shell.exec; use remote.exec only for non-interactive commands\n",
+        );
         prompt.push_str("- Use tools only when the user asks to perform an action\n");
 
         prompt
@@ -3038,7 +3117,7 @@ impl AppState {
                         args.set("name", next.name.clone());
                         self.set_status(self.i18n.tr_args("ai-tool-pending", &args));
                     }
-                    if self.config.ai.auto_mode {
+                    if self.config.ai.auto_mode || self.config.ai.agent_enabled {
                         self.start_next_tool();
                     }
                 }
@@ -3080,7 +3159,7 @@ impl AppState {
                     self.config.ai.history_max,
                 );
                 if !self.pending_tools.is_empty() {
-                    if self.config.ai.auto_mode {
+                    if self.config.ai.auto_mode || self.config.ai.agent_enabled {
                         self.start_next_tool();
                     }
                 } else if self.config.ai.agent_enabled && self.agent_steps_remaining > 0 {
@@ -4147,14 +4226,17 @@ const TOOL_OUTPUT_LIMIT: usize = 8000;
 const TOOL_DEFAULT_TIMEOUT_MS: u64 = 20000;
 const TOOL_DEFAULT_SEARCH_LIMIT: usize = 50;
 const TOOL_DEFAULT_MAX_BYTES: usize = 1_000_000;
+const TOOL_DISPLAY_MAX_LINES: usize = 20;
+const TOOL_DISPLAY_MAX_CHARS: usize = 2000;
 const SHELL_LOG_MAX_BYTES: usize = 256 * 1024;
 const SHELL_DEFAULT_WAIT_MS: u64 = 600;
-const SHELL_DEFAULT_TIMEOUT_MS: u64 = 8000;
-const SHELL_MAX_TIMEOUT_MS: u64 = 60000;
+const SHELL_DEFAULT_TIMEOUT_MS: u64 = 900_000;
+const SHELL_MAX_TIMEOUT_MS: u64 = 900_000;
 const SHELL_MAX_WAIT_MS: u64 = 10000;
 const SHELL_DEFAULT_MAX_BYTES: usize = 8192;
 const SHELL_RESPONSE_PAD_MS: u64 = 1000;
 const SHELL_SCREEN_LINES: usize = 20;
+const SHELL_MARKER_PREFIX: &str = "CATSOLLE_DONE";
 
 async fn execute_tool_call(call: ToolCall, ctx: ToolContext) -> ToolResult {
     let result = match call.name.as_str() {
@@ -4272,10 +4354,228 @@ fn trim_output(value: &str) -> String {
     format!("{trimmed}...")
 }
 
+fn tool_display_text(content: &str) -> String {
+    let Some((name, payload)) = split_tool_message(content) else {
+        return limit_tool_display(content);
+    };
+    let mut lines = Vec::new();
+    let is_shell = name == "remote.shell.exec";
+    lines.push(name);
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) {
+        if is_shell {
+            if let Some(status) = value.get("status").and_then(|v| v.as_i64()) {
+                lines.push(format!("status: {status}"));
+            } else {
+                lines.push("status: unknown".to_string());
+            }
+            if value.get("timed_out").and_then(|v| v.as_bool()) == Some(true) {
+                lines.push("timed_out: true".to_string());
+            }
+            if value.get("truncated").and_then(|v| v.as_bool()) == Some(true) {
+                lines.push("truncated: true".to_string());
+            }
+            return lines.join("\n");
+        }
+        if let Some(output) = value.get("output").and_then(|v| v.as_str()) {
+            lines.push(limit_tool_display(output));
+            return lines.join("\n");
+        }
+        if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
+            if let Some(path) = value.get("path").and_then(|v| v.as_str()) {
+                lines.push(path.to_string());
+            }
+            lines.push(limit_tool_display(content));
+            return lines.join("\n");
+        }
+        if let Some(path) = value.get("path").and_then(|v| v.as_str()) {
+            let mut line = path.to_string();
+            if let Some(bytes) = value.get("bytes").and_then(|v| v.as_u64()) {
+                line.push_str(&format!(" ({} байт)", bytes));
+            }
+            if let Some(entries) = value.get("entries").and_then(|v| v.as_array()) {
+                line.push_str(&format!(", entries: {}", entries.len()));
+            }
+            lines.push(line);
+            return lines.join("\n");
+        }
+        if let Some(job_id) = value.get("job_id").and_then(|v| v.as_str()) {
+            lines.push(format!("job_id: {job_id}"));
+            return lines.join("\n");
+        }
+        if let Ok(pretty) = serde_json::to_string_pretty(&value) {
+            lines.push(limit_tool_display(&pretty));
+            return lines.join("\n");
+        }
+    }
+    lines.push(limit_tool_display(&payload));
+    lines.join("\n")
+}
+
+fn split_tool_message(content: &str) -> Option<(String, String)> {
+    let trimmed = content.trim_start();
+    let rest = trimmed.strip_prefix("Tool result (")?;
+    let end = rest.find(')')?;
+    let name = rest[..end].trim().to_string();
+    let payload = rest[end + 1..]
+        .trim_start()
+        .trim_start_matches('\n')
+        .to_string();
+    Some((name, payload))
+}
+
+fn limit_tool_display(value: &str) -> String {
+    let limited = limit_lines(value, TOOL_DISPLAY_MAX_LINES);
+    trim_output_with_limit(&limited, TOOL_DISPLAY_MAX_CHARS)
+}
+
+fn limit_lines(value: &str, max_lines: usize) -> String {
+    let mut out = Vec::new();
+    for (count, line) in value.lines().enumerate() {
+        if count >= max_lines {
+            break;
+        }
+        out.push(line);
+    }
+    let mut result = out.join("\n");
+    if value.lines().count() > max_lines {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str("...");
+    }
+    result
+}
+
+fn trim_output_with_limit(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    let trimmed: String = value.chars().take(limit.saturating_sub(3)).collect();
+    format!("{trimmed}...")
+}
+
+fn shell_marker_command(token: &str) -> String {
+    format!(
+        "printf '\\x1b]{};{};%s\\x07' \"$?\"",
+        SHELL_MARKER_PREFIX, token
+    )
+}
+
+fn find_shell_marker_in_bytes(bytes: &[u8], token: &str) -> Option<(usize, usize, i32)> {
+    let prefix = format!("\x1b]{};{};", SHELL_MARKER_PREFIX, token);
+    let prefix_bytes = prefix.as_bytes();
+    if prefix_bytes.is_empty() {
+        return None;
+    }
+    let mut idx = 0;
+    while idx + prefix_bytes.len() <= bytes.len() {
+        if bytes[idx..].starts_with(prefix_bytes) {
+            let mut pos = idx + prefix_bytes.len();
+            let mut status: i32 = 0;
+            let mut digits = 0;
+            while pos < bytes.len() {
+                let b = bytes[pos];
+                if b.is_ascii_digit() {
+                    status = status.saturating_mul(10).saturating_add((b - b'0') as i32);
+                    digits += 1;
+                    pos += 1;
+                    continue;
+                }
+                if b == 0x07 {
+                    pos += 1;
+                    if digits > 0 {
+                        return Some((idx, pos, status));
+                    }
+                    break;
+                }
+                if b == 0x1b && pos + 1 < bytes.len() && bytes[pos + 1] == b'\\' {
+                    pos += 2;
+                    if digits > 0 {
+                        return Some((idx, pos, status));
+                    }
+                    break;
+                }
+                break;
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn clean_shell_output(value: &str) -> String {
+    let stripped = strip_ansi(value);
+    stripped.replace('\r', "")
+}
+
+fn strip_ansi(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x1b => {
+                i += 1;
+                if i >= bytes.len() {
+                    break;
+                }
+                match bytes[i] {
+                    b'[' => {
+                        i += 1;
+                        while i < bytes.len() && !(bytes[i] >= 0x40 && bytes[i] <= 0x7e) {
+                            i += 1;
+                        }
+                        if i < bytes.len() {
+                            i += 1;
+                        }
+                    }
+                    b']' => {
+                        i += 1;
+                        while i < bytes.len() {
+                            if bytes[i] == 0x07 {
+                                i += 1;
+                                break;
+                            }
+                            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                                i += 2;
+                                break;
+                            }
+                            i += 1;
+                        }
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+            0x9b => {
+                i += 1;
+                while i < bytes.len() && !(bytes[i] >= 0x40 && bytes[i] <= 0x7e) {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 #[derive(Serialize)]
 struct ToolExecOutput {
     status: i32,
     output: String,
+    interactive: bool,
+    screen: Option<String>,
+    timed_out: Option<bool>,
+    truncated: Option<bool>,
+    start_offset: Option<u64>,
+    end_offset: Option<u64>,
 }
 
 async fn tool_local_exec(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
@@ -4303,6 +4603,12 @@ async fn tool_local_exec(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
     let result = ToolExecOutput {
         status,
         output: trim_output(&combined),
+        interactive: false,
+        screen: None,
+        timed_out: None,
+        truncated: None,
+        start_offset: None,
+        end_offset: None,
     };
     Ok(serde_json::to_string_pretty(&result)?)
 }
@@ -4310,6 +4616,38 @@ async fn tool_local_exec(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
 async fn tool_remote_exec(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
     let command = tool_required_string(&call.args, "command")?;
     let timeout_ms = tool_arg_u64(&call.args, "timeout_ms").unwrap_or(TOOL_DEFAULT_TIMEOUT_MS);
+    let prefer_interactive = tool_arg_bool(&call.args, "interactive").unwrap_or(true);
+    if prefer_interactive {
+        match run_shell_tool(
+            command.clone(),
+            true,
+            SHELL_DEFAULT_WAIT_MS,
+            timeout_ms,
+            SHELL_DEFAULT_MAX_BYTES,
+            true,
+            ctx,
+        )
+        .await
+        {
+            Ok(response) => {
+                let status = response.status.unwrap_or(-1);
+                let result = ToolExecOutput {
+                    status,
+                    output: response.output,
+                    interactive: true,
+                    screen: Some(response.screen),
+                    timed_out: Some(response.timed_out),
+                    truncated: Some(response.truncated),
+                    start_offset: Some(response.start_offset),
+                    end_offset: Some(response.end_offset),
+                };
+                return Ok(serde_json::to_string_pretty(&result)?);
+            }
+            Err(err) => {
+                warn!(error = %err, "shell exec fallback");
+            }
+        }
+    }
     let session_id = ctx
         .session_id
         .ok_or_else(|| anyhow::anyhow!("no active session"))?;
@@ -4327,6 +4665,12 @@ async fn tool_remote_exec(call: &ToolCall, ctx: &ToolContext) -> Result<String> 
     let result = ToolExecOutput {
         status,
         output: trim_output(&text),
+        interactive: false,
+        screen: None,
+        timed_out: None,
+        truncated: None,
+        start_offset: None,
+        end_offset: None,
     };
     Ok(serde_json::to_string_pretty(&result)?)
 }
@@ -4341,6 +4685,7 @@ struct ToolShellOutput {
     truncated: bool,
     timed_out: bool,
     screen: String,
+    status: Option<i32>,
 }
 
 async fn tool_remote_shell_exec(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
@@ -4349,31 +4694,16 @@ async fn tool_remote_shell_exec(call: &ToolCall, ctx: &ToolContext) -> Result<St
     let wait_ms = tool_arg_u64(&call.args, "wait_ms").unwrap_or(SHELL_DEFAULT_WAIT_MS);
     let timeout_ms = tool_arg_u64(&call.args, "timeout_ms").unwrap_or(SHELL_DEFAULT_TIMEOUT_MS);
     let max_bytes = tool_arg_usize(&call.args, "max_bytes").unwrap_or(SHELL_DEFAULT_MAX_BYTES);
-    let (tx, rx) = oneshot::channel();
-    ctx.shell_tool_tx
-        .send(ShellToolRequest {
-            input,
-            append_newline,
-            wait_ms,
-            timeout_ms,
-            max_bytes,
-            tx,
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("shell tool unavailable"))?;
-    let total_wait = timeout_ms
-        .min(SHELL_MAX_TIMEOUT_MS)
-        .saturating_add(SHELL_RESPONSE_PAD_MS);
-    let response = if total_wait == 0 {
-        rx.await
-    } else {
-        timeout(Duration::from_millis(total_wait), rx)
-            .await
-            .map_err(|_| anyhow::anyhow!("shell tool timeout"))?
-    };
-    let response = response
-        .map_err(|_| anyhow::anyhow!("shell tool response dropped"))?
-        .map_err(|err| anyhow::anyhow!(err))?;
+    let response = run_shell_tool(
+        input,
+        append_newline,
+        wait_ms,
+        timeout_ms,
+        max_bytes,
+        true,
+        ctx,
+    )
+    .await?;
     let output = ToolShellOutput {
         output: response.output,
         bytes: response.bytes,
@@ -4383,8 +4713,70 @@ async fn tool_remote_shell_exec(call: &ToolCall, ctx: &ToolContext) -> Result<St
         truncated: response.truncated,
         timed_out: response.timed_out,
         screen: response.screen,
+        status: response.status,
     };
     Ok(serde_json::to_string_pretty(&output)?)
+}
+
+async fn run_shell_tool(
+    input: String,
+    append_newline: bool,
+    wait_ms: u64,
+    timeout_ms: u64,
+    max_bytes: usize,
+    use_marker: bool,
+    ctx: &ToolContext,
+) -> Result<ShellToolResponse> {
+    let (tx, rx) = oneshot::channel();
+    let marker = if use_marker {
+        Some(Uuid::new_v4().to_string())
+    } else {
+        None
+    };
+    let mut final_input = input;
+    if let Some(token) = marker.as_ref() {
+        let marker_cmd = shell_marker_command(token);
+        if final_input.ends_with('\n') || final_input.ends_with('\r') {
+            final_input.push_str(&marker_cmd);
+        } else if append_newline {
+            final_input.push('\n');
+            final_input.push_str(&marker_cmd);
+        } else {
+            final_input.push_str("; ");
+            final_input.push_str(&marker_cmd);
+        }
+    }
+    if append_newline && !final_input.ends_with('\n') && !final_input.ends_with('\r') {
+        final_input.push('\n');
+    }
+    ctx.shell_tool_tx
+        .send(ShellToolRequest {
+            input: final_input,
+            append_newline,
+            wait_ms,
+            timeout_ms,
+            max_bytes,
+            marker,
+            tx,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("shell tool unavailable"))?;
+    let effective_timeout_ms = if timeout_ms == 0 {
+        SHELL_MAX_TIMEOUT_MS.max(wait_ms)
+    } else {
+        timeout_ms.min(SHELL_MAX_TIMEOUT_MS).max(wait_ms)
+    };
+    let total_wait = effective_timeout_ms.saturating_add(SHELL_RESPONSE_PAD_MS);
+    let response = if total_wait == 0 {
+        rx.await
+    } else {
+        timeout(Duration::from_millis(total_wait), rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("shell tool timeout"))?
+    };
+    response
+        .map_err(|_| anyhow::anyhow!("shell tool response dropped"))?
+        .map_err(|err| anyhow::anyhow!(err))
 }
 
 #[derive(Serialize)]
@@ -5110,8 +5502,8 @@ fn tool_definitions() -> Vec<String> {
     vec![
         "Tools:",
         "- local.exec {command, timeout_ms?}",
-        "- remote.exec {command, timeout_ms?}",
         "- remote.shell.exec {input, append_newline?, wait_ms?, timeout_ms?, max_bytes?}",
+        "- remote.exec {command, timeout_ms?, interactive?}",
         "- local.list {path?, limit?, include_hidden?}",
         "- remote.list {path?, limit?, include_hidden?}",
         "- local.read {path, max_bytes?}",
@@ -5133,6 +5525,21 @@ fn tool_definitions() -> Vec<String> {
     .into_iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
+    let width = width.max(1) as usize;
+    lines
+        .iter()
+        .map(|line| {
+            let line_width = line.width();
+            if line_width == 0 {
+                1
+            } else {
+                line_width.div_ceil(width)
+            }
+        })
+        .sum()
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -5443,6 +5850,13 @@ fn parse_inline_markdown(text: &str, ctx: &MdRenderContext) -> Vec<Span<'static>
                 let bold: String = chars[start..i].iter().collect();
                 spans.push(Span::styled(bold, base.add_modifier(Modifier::BOLD)));
                 i += 2;
+            } else {
+                let mut text = String::new();
+                text.push('*');
+                text.push('*');
+                text.push_str(&chars[start..].iter().collect::<String>());
+                spans.push(Span::styled(text, base));
+                break;
             }
             continue;
         }
@@ -5464,6 +5878,12 @@ fn parse_inline_markdown(text: &str, ctx: &MdRenderContext) -> Vec<Span<'static>
                     spans.push(Span::styled(italic, base.add_modifier(Modifier::ITALIC)));
                     i += 1;
                     continue;
+                } else {
+                    let mut text = String::new();
+                    text.push(marker);
+                    text.push_str(&chars[start..].iter().collect::<String>());
+                    spans.push(Span::styled(text, base));
+                    break;
                 }
             }
         }
@@ -5557,5 +5977,79 @@ mod tests {
         let slice = log.read_from(0, 10);
         assert_eq!(slice.bytes, b"world");
         assert!(slice.trimmed);
+    }
+
+    #[test]
+    fn inline_markdown_keeps_unclosed_italic() {
+        let input = "hello *world";
+        let ctx = MdRenderContext {
+            block_type: MdBlockType::Normal,
+            theme: Theme::kawaii(),
+            base_style: Style::default(),
+        };
+        let spans = parse_inline_markdown(input, &ctx);
+        let out: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn inline_markdown_keeps_unclosed_bold() {
+        let input = "hello **world";
+        let ctx = MdRenderContext {
+            block_type: MdBlockType::Normal,
+            theme: Theme::kawaii(),
+            base_style: Style::default(),
+        };
+        let spans = parse_inline_markdown(input, &ctx);
+        let out: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn strips_ansi_sequences() {
+        let input = "\u{1b}[31mred\u{1b}[0m plain";
+        assert_eq!(strip_ansi(input), "red plain");
+    }
+
+    #[test]
+    fn tool_display_shows_output_only() {
+        let content = "Tool result (remote.exec)\n{\"output\":\"hello\\nworld\",\"status\":0}";
+        let rendered = tool_display_text(content);
+        assert_eq!(rendered, "remote.exec\nhello\nworld");
+    }
+
+    #[test]
+    fn tool_display_hides_shell_output() {
+        let content = "Tool result (remote.shell.exec)\n{\"output\":\"hello\",\"status\":3}";
+        let rendered = tool_display_text(content);
+        assert_eq!(rendered, "remote.shell.exec\nstatus: 3");
+    }
+
+    #[test]
+    fn tool_display_falls_back_to_payload() {
+        let content = "Tool result (transfer.copy)\nnot-json";
+        let rendered = tool_display_text(content);
+        assert_eq!(rendered, "transfer.copy\nnot-json");
+    }
+
+    #[test]
+    fn wrapped_line_count_handles_wrap() {
+        let lines = vec![Line::from("12345"), Line::from("123456789")];
+        assert_eq!(wrapped_line_count(&lines, 5), 3);
+        assert_eq!(wrapped_line_count(&lines, 4), 5);
+    }
+
+    #[test]
+    fn finds_shell_marker_status() {
+        let token = "abc";
+        let data = format!("\x1b]CATSOLLE_DONE;{};7\x07", token);
+        let (_, _, status) = find_shell_marker_in_bytes(data.as_bytes(), token).unwrap();
+        assert_eq!(status, 7);
+    }
+
+    #[test]
+    fn ignores_other_shell_marker() {
+        let data = "\x1b]CATSOLLE_DONE;other;1\x07";
+        assert!(find_shell_marker_in_bytes(data.as_bytes(), "token").is_none());
     }
 }

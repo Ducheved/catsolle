@@ -131,7 +131,7 @@ ai-settings-provider-ollama = Ollama
 ai-settings-provider-openai = OpenAI
 ai-settings-provider-openrouter = OpenRouter
 ai-settings-provider-anthropic = Anthropic
-ai-command-help = Commands: /ai on|off, /agent on|off, /tools on|off, /auto on|off, /steps N, /run, /skip, /clear, /status, /help
+ai-command-help = Commands: /ai on|off, /agent on|off, /tools on|off, /auto on|off, /steps N (0=unlimited), /run, /skip, /clear, /status, /help
 ai-command-unknown = Unknown command. /help
 ai-command-missing = Missing parameter.
 ai-command-invalid = Invalid parameter.
