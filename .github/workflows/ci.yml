@@ -177,7 +177,7 @@ jobs:
             <Package Name="catsolle"
                      Manufacturer="catsolle"
                      Version="0.1.0"
-                     UpgradeCode="6E3969B5-3C8E-4E3A-B8F5-C5D7E8F9A0B1">
+                     UpgradeCode="EDDE096C-32E9-40EE-B88B-9B78CD244F20">
               <MajorUpgrade DowngradeErrorMessage="A newer version is already installed." />
               <MediaTemplate EmbedCab="yes" />
               <Feature Id="Main" Level="1">
@@ -186,7 +186,7 @@ jobs:
               </Feature>
               <StandardDirectory Id="ProgramFiles64Folder">
                 <Directory Id="INSTALLFOLDER" Name="catsolle">
-                  <Component Id="MainExecutable" Guid="7E4A69B5-4C9E-5E4A-C9F6-D6E8F9A0B2C3">
+                  <Component Id="MainExecutable" Guid="F25D6967-3DA8-4F15-8C95-516B76EF0F23">
                     <File Id="catsolle.exe" Source="extracted\catsolle.exe" KeyPath="yes" />
                   </Component>
                 </Directory>
@@ -194,7 +194,7 @@ jobs:
               <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
                 <ComponentRef Id="MainExecutable" />
               </ComponentGroup>
-              <Component Id="PathEnv" Guid="8F5B7AC6-5DAF-6F5B-DA67-E7F9GAB1C3D4" Directory="INSTALLFOLDER">
+              <Component Id="PathEnv" Guid="35689E85-CF17-4230-B56B-047BDFC835AF" Directory="INSTALLFOLDER">
                 <Environment Id="PATH" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no" Part="last" Action="set" System="yes" />
               </Component>
             </Package>
