@@ -194,7 +194,7 @@ jobs:
               <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
                 <ComponentRef Id="MainExecutable" />
               </ComponentGroup>
-              <Component Id="PathEnv" Guid="8F5B7AC6-5DAF-6F5B-DAG7-E7F9GAB1C3D4" Directory="INSTALLFOLDER">
+              <Component Id="PathEnv" Guid="8F5B7AC6-5DAF-6F5B-DA67-E7F9GAB1C3D4" Directory="INSTALLFOLDER">
                 <Environment Id="PATH" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no" Part="last" Action="set" System="yes" />
               </Component>
             </Package>
@@ -369,6 +369,7 @@ jobs:
           # Download appimagetool
           wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool-x86_64.AppImage
+          export APPIMAGE_EXTRACT_AND_RUN=1
 
           # Create AppDir structure
           mkdir -p catsolle.AppDir/usr/bin
