@@ -29,8 +29,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::mpsc;
-use tokio::time::timeout;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{timeout, Instant};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 use vt100::Parser;
 use walkdir::WalkDir;
@@ -100,10 +101,18 @@ async fn run_app(
         terminal.draw(|f| app.draw(f))?;
         app.apply_pending_resize().await?;
 
-        let output_fut = if app.shell.is_some() {
-            Either::Left(async { app.shell.as_mut().unwrap().read().await })
+        let capture_deadline = app.shell_capture_deadline();
+        let (shell_opt, shell_tool_rx) = (&mut app.shell, &mut app.shell_tool_rx);
+        let output_fut = if shell_opt.is_some() {
+            Either::Left(async { shell_opt.as_mut().unwrap().read().await })
         } else {
             Either::Right(pending::<Option<Vec<u8>>>())
+        };
+        let shell_req_fut = shell_tool_rx.recv();
+        let deadline_fut = if let Some(deadline) = capture_deadline {
+            Either::Left(tokio::time::sleep_until(deadline))
+        } else {
+            Either::Right(pending::<()>())
         };
 
         tokio::select! {
@@ -116,7 +125,7 @@ async fn run_app(
             }
             maybe_output = output_fut => {
                 if let Some(data) = maybe_output {
-                    app.terminal_parser.process(&data);
+                    app.process_shell_output(&data);
                 }
             }
             maybe_bus = event_rx.recv() => {
@@ -132,6 +141,14 @@ async fn run_app(
                 if let Some(event) = maybe_assistant {
                     app.handle_assistant_event(event);
                 }
+            }
+            maybe_shell = shell_req_fut => {
+                if let Some(req) = maybe_shell {
+                    app.handle_shell_tool_request(req).await;
+                }
+            }
+            _ = deadline_fut => {
+                app.finish_shell_capture(true);
             }
         }
     }
@@ -155,6 +172,10 @@ struct AppState {
     mode: AppMode,
     terminal_parser: Parser,
     shell: Option<catsolle_ssh::SshShell>,
+    shell_log: ShellLog,
+    shell_capture: Option<ShellCapture>,
+    shell_tool_tx: mpsc::Sender<ShellToolRequest>,
+    shell_tool_rx: mpsc::Receiver<ShellToolRequest>,
     left_panel: PanelState,
     right_panel: PanelState,
     active_panel_left: bool,
@@ -394,6 +415,70 @@ enum AssistantEvent {
     ToolResult(ToolResult),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AssistantCommand {
+    Ai(bool),
+    Agent(bool),
+    Tools(bool),
+    Auto(bool),
+    Steps(u32),
+    Run,
+    Skip,
+    Clear,
+    Status,
+    Help,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssistantCommandError {
+    Unknown,
+    MissingValue,
+    InvalidValue,
+}
+
+struct ShellToolRequest {
+    input: String,
+    append_newline: bool,
+    wait_ms: u64,
+    timeout_ms: u64,
+    max_bytes: usize,
+    tx: oneshot::Sender<Result<ShellToolResponse, String>>,
+}
+
+struct ShellToolResponse {
+    output: String,
+    bytes: usize,
+    start_offset: u64,
+    end_offset: u64,
+    trimmed: bool,
+    truncated: bool,
+    timed_out: bool,
+    screen: String,
+}
+
+struct ShellCapture {
+    start_offset: u64,
+    max_bytes: usize,
+    wait_ms: u64,
+    idle_deadline: Instant,
+    hard_deadline: Instant,
+    tx: oneshot::Sender<Result<ShellToolResponse, String>>,
+}
+
+struct ShellLog {
+    start_offset: u64,
+    buf: VecDeque<u8>,
+    max_bytes: usize,
+}
+
+struct ShellLogSlice {
+    bytes: Vec<u8>,
+    start_offset: u64,
+    end_offset: u64,
+    trimmed: bool,
+    truncated: bool,
+}
+
 #[derive(Clone, Debug)]
 struct TransferStatus {
     progress: TransferProgress,
@@ -418,6 +503,7 @@ impl AppState {
         }
         let ai_client = client_builder.build()?;
         let assistant = AssistantState::new(&i18n);
+        let (shell_tool_tx, shell_tool_rx) = mpsc::channel::<ShellToolRequest>(8);
         let mut state = Self {
             store,
             sessions,
@@ -434,6 +520,10 @@ impl AppState {
             mode: AppMode::Connections,
             terminal_parser: parser,
             shell: None,
+            shell_log: ShellLog::new(SHELL_LOG_MAX_BYTES),
+            shell_capture: None,
+            shell_tool_tx,
+            shell_tool_rx,
             left_panel: PanelState::local_default(),
             right_panel: PanelState::remote_default(),
             active_panel_left: true,
@@ -1248,6 +1338,12 @@ impl AppState {
         }
     }
 
+    fn reset_terminal_parser(&mut self) {
+        let (width, height) = self.terminal_size.unwrap_or((80, 24));
+        self.terminal_parser = Parser::new(height, width, 0);
+        self.terminal_parser.process(b"");
+    }
+
     async fn apply_pending_resize(&mut self) -> Result<()> {
         let Some((width, height)) = self.pending_shell_resize.take() else {
             return Ok(());
@@ -1256,6 +1352,109 @@ impl AppState {
             let _ = shell.resize(width.into(), height.into()).await;
         }
         Ok(())
+    }
+
+    fn process_shell_output(&mut self, data: &[u8]) {
+        self.terminal_parser.process(data);
+        self.shell_log.append(data);
+        if let Some(capture) = self.shell_capture.as_mut() {
+            if capture.wait_ms > 0 {
+                capture.idle_deadline = Instant::now() + Duration::from_millis(capture.wait_ms);
+            }
+        }
+        self.finish_shell_capture(false);
+    }
+
+    fn shell_capture_deadline(&self) -> Option<Instant> {
+        self.shell_capture.as_ref().map(|capture| {
+            if capture.idle_deadline < capture.hard_deadline {
+                capture.idle_deadline
+            } else {
+                capture.hard_deadline
+            }
+        })
+    }
+
+    async fn handle_shell_tool_request(&mut self, req: ShellToolRequest) {
+        if self.shell_capture.is_some() {
+            warn!("shell tool busy");
+            let _ = req.tx.send(Err("shell tool busy".to_string()));
+            return;
+        }
+        let Some(shell) = self.shell.as_mut() else {
+            warn!("shell tool no active shell");
+            let _ = req.tx.send(Err("no active shell".to_string()));
+            return;
+        };
+        let mut input = req.input;
+        if req.append_newline && !input.ends_with('\n') && !input.ends_with('\r') {
+            input.push('\n');
+        }
+        let wait_ms = req.wait_ms.min(SHELL_MAX_WAIT_MS);
+        let timeout_ms = req.timeout_ms.min(SHELL_MAX_TIMEOUT_MS).max(wait_ms);
+        let max_bytes = req.max_bytes.clamp(1, SHELL_LOG_MAX_BYTES);
+        let start_offset = self.shell_log.end_offset();
+        if let Err(err) = shell.write(input.as_bytes()).await {
+            warn!(error = %err, "shell tool write failed");
+            let _ = req.tx.send(Err(err.to_string()));
+            return;
+        }
+        let now = Instant::now();
+        let idle_deadline = now + Duration::from_millis(wait_ms);
+        let hard_deadline = now + Duration::from_millis(timeout_ms);
+        self.shell_capture = Some(ShellCapture {
+            start_offset,
+            max_bytes,
+            wait_ms,
+            idle_deadline,
+            hard_deadline,
+            tx: req.tx,
+        });
+        info!(
+            start_offset = start_offset,
+            wait_ms = wait_ms,
+            timeout_ms = timeout_ms,
+            "shell tool requested"
+        );
+    }
+
+    fn finish_shell_capture(&mut self, force: bool) {
+        let Some(capture) = self.shell_capture.as_ref() else {
+            return;
+        };
+        let slice = self
+            .shell_log
+            .read_from(capture.start_offset, capture.max_bytes);
+        let should_finish = force || slice.bytes.len() >= capture.max_bytes;
+        if !should_finish {
+            return;
+        }
+        let capture = self.shell_capture.take().unwrap();
+        let timed_out = force && Instant::now() >= capture.hard_deadline;
+        let response = self.build_shell_response(slice, timed_out);
+        let _ = capture.tx.send(Ok(response));
+    }
+
+    fn build_shell_response(&self, slice: ShellLogSlice, timed_out: bool) -> ShellToolResponse {
+        let raw = String::from_utf8_lossy(&slice.bytes).to_string();
+        let trimmed = trim_output(&raw);
+        let truncated = slice.truncated || trimmed.len() < raw.len();
+        ShellToolResponse {
+            output: trimmed,
+            bytes: slice.bytes.len(),
+            start_offset: slice.start_offset,
+            end_offset: slice.end_offset,
+            trimmed: slice.trimmed,
+            truncated,
+            timed_out,
+            screen: self.get_terminal_context(SHELL_SCREEN_LINES),
+        }
+    }
+
+    fn abort_shell_capture(&mut self, message: &str) {
+        if let Some(capture) = self.shell_capture.take() {
+            let _ = capture.tx.send(Err(message.to_string()));
+        }
     }
 
     fn format_transfer_status(&self, progress: &TransferProgress) -> String {
@@ -2227,6 +2426,8 @@ impl AppState {
             KeyCode::Esc => {
                 self.mode = AppMode::Connections;
                 self.shell = None;
+                self.abort_shell_capture("session closed");
+                self.shell_log.clear();
                 self.active_connection = None;
                 self.pending_tools.clear();
                 self.tool_busy = false;
@@ -2415,6 +2616,22 @@ impl AppState {
     }
 
     fn submit_assistant_request(&mut self) {
+        let input = self.assistant.input.trim().to_string();
+        if input.is_empty() {
+            return;
+        }
+        self.assistant.input.clear();
+        match parse_assistant_command(&input) {
+            Ok(Some(cmd)) => {
+                self.apply_assistant_command(cmd);
+                return;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.handle_assistant_command_error(err);
+                return;
+            }
+        }
         if !self.config.ai.enabled {
             self.assistant.push_message(
                 AssistantMessage {
@@ -2438,11 +2655,6 @@ impl AppState {
         if self.assistant.busy {
             return;
         }
-        let input = self.assistant.input.trim().to_string();
-        if input.is_empty() {
-            return;
-        }
-        self.assistant.input.clear();
         self.assistant.push_message(
             AssistantMessage {
                 role: AssistantRole::User,
@@ -2589,9 +2801,174 @@ impl AppState {
         prompt.push_str("- Be concise but helpful\n");
         prompt.push_str("- Suggest exact commands when relevant\n");
         prompt.push_str("- Warn about destructive operations\n");
+        prompt.push_str("- Use remote.shell.exec for interactive shell commands\n");
         prompt.push_str("- Use tools only when the user asks to perform an action\n");
 
         prompt
+    }
+
+    fn handle_assistant_command_error(&mut self, err: AssistantCommandError) {
+        let msg = match err {
+            AssistantCommandError::Unknown => self.i18n.tr("ai-command-unknown"),
+            AssistantCommandError::MissingValue => self.i18n.tr("ai-command-missing"),
+            AssistantCommandError::InvalidValue => self.i18n.tr("ai-command-invalid"),
+        };
+        warn!(error = %msg, "assistant command error");
+        self.push_error_message(msg);
+    }
+
+    fn apply_assistant_command(&mut self, cmd: AssistantCommand) {
+        match cmd {
+            AssistantCommand::Ai(value) => {
+                self.config.ai.enabled = value;
+                self.save_ai_config();
+                self.push_config_update(
+                    self.i18n.tr("ai-settings-enabled"),
+                    self.bool_label(value),
+                );
+            }
+            AssistantCommand::Agent(value) => {
+                self.config.ai.agent_enabled = value;
+                self.save_ai_config();
+                self.push_config_update(self.i18n.tr("ai-settings-agent"), self.bool_label(value));
+            }
+            AssistantCommand::Tools(value) => {
+                self.config.ai.tools_enabled = value;
+                if !self.config.ai.tools_enabled {
+                    self.pending_tools.clear();
+                    self.tool_busy = false;
+                }
+                self.save_ai_config();
+                self.push_config_update(self.i18n.tr("ai-settings-tools"), self.bool_label(value));
+            }
+            AssistantCommand::Auto(value) => {
+                self.config.ai.auto_mode = value;
+                self.save_ai_config();
+                self.push_config_update(self.i18n.tr("ai-settings-auto"), self.bool_label(value));
+            }
+            AssistantCommand::Steps(value) => {
+                self.config.ai.max_steps = value;
+                self.save_ai_config();
+                self.push_config_update(self.i18n.tr("ai-settings-max-steps"), value.to_string());
+            }
+            AssistantCommand::Run => {
+                if self.pending_tools.is_empty() {
+                    self.push_system_message(self.i18n.tr("ai-command-run-empty"));
+                    return;
+                }
+                self.start_next_tool();
+                self.push_system_message(self.i18n.tr("ai-tool-running"));
+            }
+            AssistantCommand::Skip => {
+                if let Some(skipped) = self.pending_tools.pop_front() {
+                    let mut args = FluentArgs::new();
+                    args.set("name", skipped.name);
+                    self.set_status(self.i18n.tr_args("ai-tool-skipped", &args));
+                    self.push_system_message(self.i18n.tr_args("ai-tool-skipped", &args));
+                    if self.config.ai.auto_mode {
+                        self.start_next_tool();
+                    }
+                } else {
+                    self.push_system_message(self.i18n.tr("ai-command-skip-empty"));
+                }
+            }
+            AssistantCommand::Clear => {
+                self.clear_assistant_state();
+                self.push_system_message(self.i18n.tr("ai-command-cleared"));
+            }
+            AssistantCommand::Status => {
+                self.push_system_message(self.assistant_status_message());
+            }
+            AssistantCommand::Help => {
+                self.push_system_message(self.i18n.tr("ai-command-help"));
+            }
+        }
+    }
+
+    fn assistant_status_message(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "{}: {}",
+            self.i18n.tr("ai-settings-enabled"),
+            self.bool_label(self.config.ai.enabled)
+        ));
+        lines.push(format!(
+            "{}: {}",
+            self.i18n.tr("ai-settings-agent"),
+            self.bool_label(self.config.ai.agent_enabled)
+        ));
+        lines.push(format!(
+            "{}: {}",
+            self.i18n.tr("ai-settings-tools"),
+            self.bool_label(self.config.ai.tools_enabled)
+        ));
+        lines.push(format!(
+            "{}: {}",
+            self.i18n.tr("ai-settings-auto"),
+            self.bool_label(self.config.ai.auto_mode)
+        ));
+        lines.push(format!(
+            "{}: {}",
+            self.i18n.tr("ai-settings-max-steps"),
+            self.config.ai.max_steps
+        ));
+        lines.push(format!(
+            "{}: {}",
+            self.i18n.tr("ai-settings-streaming"),
+            self.bool_label(self.config.ai.streaming)
+        ));
+        lines.push(format!(
+            "{}: {}",
+            self.i18n.tr("ai-settings-provider"),
+            self.provider_label(&self.config.ai.provider)
+        ));
+        lines.push(format!(
+            "{}: {}",
+            self.i18n.tr("ai-settings-model"),
+            self.config.ai.model
+        ));
+        lines.join("\n")
+    }
+
+    fn clear_assistant_state(&mut self) {
+        self.assistant = AssistantState::new(&self.i18n);
+        self.pending_tools.clear();
+        self.tool_busy = false;
+        self.agent_steps_remaining = 0;
+    }
+
+    fn push_system_message(&mut self, content: String) {
+        self.assistant.push_message(
+            AssistantMessage {
+                role: AssistantRole::System,
+                content,
+            },
+            self.config.ai.history_max,
+        );
+    }
+
+    fn push_error_message(&mut self, content: String) {
+        self.assistant.push_message(
+            AssistantMessage {
+                role: AssistantRole::Error,
+                content,
+            },
+            self.config.ai.history_max,
+        );
+    }
+
+    fn push_config_update(&mut self, key: String, value: String) {
+        let mut args = FluentArgs::new();
+        args.set("key", key);
+        args.set("value", value);
+        self.push_system_message(self.i18n.tr_args("ai-command-updated", &args));
+    }
+
+    fn save_ai_config(&mut self) {
+        if let Err(err) = self.config_manager.save_config(&self.config) {
+            error!(error = %err, "ai config save failed");
+            self.push_error_message(err.to_string());
+        }
     }
 
     fn get_terminal_context(&self, max_lines: usize) -> String {
@@ -2741,6 +3118,10 @@ impl AppState {
             _ => None,
         };
         let connections = self.connections.clone();
+        let left_panel = self.left_panel.clone();
+        let right_panel = self.right_panel.clone();
+        let active_panel_left = self.active_panel_left;
+        let shell_tool_tx = self.shell_tool_tx.clone();
         tokio::spawn(async move {
             let ctx = ToolContext {
                 sessions,
@@ -2750,6 +3131,10 @@ impl AppState {
                 remote_base,
                 session_id,
                 connections,
+                left_panel,
+                right_panel,
+                active_panel_left,
+                shell_tool_tx,
             };
             let result = execute_tool_call(call, ctx).await;
             let _ = tx.send(AssistantEvent::ToolResult(result)).await;
@@ -2765,6 +3150,9 @@ impl AppState {
         self.pending_tools.clear();
         self.tool_busy = false;
         self.agent_steps_remaining = 0;
+        self.abort_shell_capture("session reset");
+        self.shell_log.clear();
+        self.reset_terminal_parser();
         self.ensure_focus_valid();
         if let Some(handle) = self.sessions.get_session(session_id) {
             let shell = handle
@@ -3622,6 +4010,125 @@ fn extract_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
     (cleaned, calls)
 }
 
+fn parse_assistant_command(input: &str) -> Result<Option<AssistantCommand>, AssistantCommandError> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return Ok(None);
+    }
+    let mut parts = trimmed.trim_start_matches('/').split_whitespace();
+    let name = parts.next().unwrap_or("");
+    let arg = parts.next();
+    match name {
+        "ai" => {
+            let value = arg.ok_or(AssistantCommandError::MissingValue)?;
+            parse_bool_token(value)
+                .map(|v| Some(AssistantCommand::Ai(v)))
+                .ok_or(AssistantCommandError::InvalidValue)
+        }
+        "agent" => {
+            let value = arg.ok_or(AssistantCommandError::MissingValue)?;
+            parse_bool_token(value)
+                .map(|v| Some(AssistantCommand::Agent(v)))
+                .ok_or(AssistantCommandError::InvalidValue)
+        }
+        "tools" => {
+            let value = arg.ok_or(AssistantCommandError::MissingValue)?;
+            parse_bool_token(value)
+                .map(|v| Some(AssistantCommand::Tools(v)))
+                .ok_or(AssistantCommandError::InvalidValue)
+        }
+        "auto" => {
+            let value = arg.ok_or(AssistantCommandError::MissingValue)?;
+            parse_bool_token(value)
+                .map(|v| Some(AssistantCommand::Auto(v)))
+                .ok_or(AssistantCommandError::InvalidValue)
+        }
+        "steps" => {
+            let value = arg.ok_or(AssistantCommandError::MissingValue)?;
+            let steps = value
+                .parse::<u32>()
+                .map_err(|_| AssistantCommandError::InvalidValue)?;
+            Ok(Some(AssistantCommand::Steps(steps)))
+        }
+        "run" => Ok(Some(AssistantCommand::Run)),
+        "skip" => Ok(Some(AssistantCommand::Skip)),
+        "clear" => Ok(Some(AssistantCommand::Clear)),
+        "status" => Ok(Some(AssistantCommand::Status)),
+        "help" => Ok(Some(AssistantCommand::Help)),
+        _ => Err(AssistantCommandError::Unknown),
+    }
+}
+
+fn parse_bool_token(value: &str) -> Option<bool> {
+    match value.to_lowercase().as_str() {
+        "on" | "true" | "1" | "yes" | "y" => Some(true),
+        "off" | "false" | "0" | "no" | "n" => Some(false),
+        _ => None,
+    }
+}
+
+impl ShellLog {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            start_offset: 0,
+            buf: VecDeque::new(),
+            max_bytes: max_bytes.max(1),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.start_offset = 0;
+        self.buf.clear();
+    }
+
+    fn end_offset(&self) -> u64 {
+        self.start_offset + self.buf.len() as u64
+    }
+
+    fn append(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        for byte in data {
+            self.buf.push_back(*byte);
+        }
+        while self.buf.len() > self.max_bytes {
+            self.buf.pop_front();
+            self.start_offset += 1;
+        }
+    }
+
+    fn read_from(&self, offset: u64, max_bytes: usize) -> ShellLogSlice {
+        let mut start = offset;
+        let mut trimmed = false;
+        if start < self.start_offset {
+            start = self.start_offset;
+            trimmed = true;
+        }
+        let available = self.end_offset().saturating_sub(start) as usize;
+        let limit = max_bytes.max(1).min(available);
+        let mut bytes = Vec::with_capacity(limit);
+        let mut idx = self.start_offset;
+        for byte in &self.buf {
+            if idx >= start && bytes.len() < limit {
+                bytes.push(*byte);
+            }
+            idx += 1;
+            if bytes.len() >= limit {
+                break;
+            }
+        }
+        let truncated = available > limit;
+        ShellLogSlice {
+            start_offset: start,
+            end_offset: start + bytes.len() as u64,
+            bytes,
+            trimmed,
+            truncated,
+        }
+    }
+}
+
 struct ToolContext {
     sessions: Arc<SessionManager>,
     queue: TransferQueue,
@@ -3630,17 +4137,30 @@ struct ToolContext {
     remote_base: String,
     session_id: Option<Uuid>,
     connections: Vec<Connection>,
+    left_panel: PanelState,
+    right_panel: PanelState,
+    active_panel_left: bool,
+    shell_tool_tx: mpsc::Sender<ShellToolRequest>,
 }
 
 const TOOL_OUTPUT_LIMIT: usize = 8000;
 const TOOL_DEFAULT_TIMEOUT_MS: u64 = 20000;
 const TOOL_DEFAULT_SEARCH_LIMIT: usize = 50;
 const TOOL_DEFAULT_MAX_BYTES: usize = 1_000_000;
+const SHELL_LOG_MAX_BYTES: usize = 256 * 1024;
+const SHELL_DEFAULT_WAIT_MS: u64 = 600;
+const SHELL_DEFAULT_TIMEOUT_MS: u64 = 8000;
+const SHELL_MAX_TIMEOUT_MS: u64 = 60000;
+const SHELL_MAX_WAIT_MS: u64 = 10000;
+const SHELL_DEFAULT_MAX_BYTES: usize = 8192;
+const SHELL_RESPONSE_PAD_MS: u64 = 1000;
+const SHELL_SCREEN_LINES: usize = 20;
 
 async fn execute_tool_call(call: ToolCall, ctx: ToolContext) -> ToolResult {
     let result = match call.name.as_str() {
         "local.exec" => tool_local_exec(&call, &ctx).await,
         "remote.exec" => tool_remote_exec(&call, &ctx).await,
+        "remote.shell.exec" => tool_remote_shell_exec(&call, &ctx).await,
         "local.list" => tool_local_list(&call, &ctx).await,
         "remote.list" => tool_remote_list(&call, &ctx).await,
         "local.read" => tool_local_read(&call, &ctx).await,
@@ -3656,6 +4176,7 @@ async fn execute_tool_call(call: ToolCall, ctx: ToolContext) -> ToolResult {
         "local.rename" => tool_local_rename(&call, &ctx).await,
         "remote.rename" => tool_remote_rename(&call, &ctx).await,
         "transfer.copy" => tool_transfer_copy(&call, &ctx).await,
+        "transfer.copy_selected" => tool_transfer_copy_selected(&call, &ctx).await,
         "connections.list" => tool_connections_list(&call, &ctx).await,
         _ => Err(anyhow::anyhow!("unknown tool: {}", call.name)),
     };
@@ -3808,6 +4329,62 @@ async fn tool_remote_exec(call: &ToolCall, ctx: &ToolContext) -> Result<String> 
         output: trim_output(&text),
     };
     Ok(serde_json::to_string_pretty(&result)?)
+}
+
+#[derive(Serialize)]
+struct ToolShellOutput {
+    output: String,
+    bytes: usize,
+    start_offset: u64,
+    end_offset: u64,
+    trimmed: bool,
+    truncated: bool,
+    timed_out: bool,
+    screen: String,
+}
+
+async fn tool_remote_shell_exec(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let input = tool_required_string(&call.args, "input")?;
+    let append_newline = tool_arg_bool(&call.args, "append_newline").unwrap_or(true);
+    let wait_ms = tool_arg_u64(&call.args, "wait_ms").unwrap_or(SHELL_DEFAULT_WAIT_MS);
+    let timeout_ms = tool_arg_u64(&call.args, "timeout_ms").unwrap_or(SHELL_DEFAULT_TIMEOUT_MS);
+    let max_bytes = tool_arg_usize(&call.args, "max_bytes").unwrap_or(SHELL_DEFAULT_MAX_BYTES);
+    let (tx, rx) = oneshot::channel();
+    ctx.shell_tool_tx
+        .send(ShellToolRequest {
+            input,
+            append_newline,
+            wait_ms,
+            timeout_ms,
+            max_bytes,
+            tx,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("shell tool unavailable"))?;
+    let total_wait = timeout_ms
+        .min(SHELL_MAX_TIMEOUT_MS)
+        .saturating_add(SHELL_RESPONSE_PAD_MS);
+    let response = if total_wait == 0 {
+        rx.await
+    } else {
+        timeout(Duration::from_millis(total_wait), rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("shell tool timeout"))?
+    };
+    let response = response
+        .map_err(|_| anyhow::anyhow!("shell tool response dropped"))?
+        .map_err(|err| anyhow::anyhow!(err))?;
+    let output = ToolShellOutput {
+        output: response.output,
+        bytes: response.bytes,
+        start_offset: response.start_offset,
+        end_offset: response.end_offset,
+        trimmed: response.trimmed,
+        truncated: response.truncated,
+        timed_out: response.timed_out,
+        screen: response.screen,
+    };
+    Ok(serde_json::to_string_pretty(&output)?)
 }
 
 #[derive(Serialize)]
@@ -4298,6 +4875,77 @@ async fn tool_transfer_copy(call: &ToolCall, ctx: &ToolContext) -> Result<String
     })?)
 }
 
+async fn tool_transfer_copy_selected(_call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let (src, dst) = if ctx.active_panel_left {
+        (&ctx.left_panel, &ctx.right_panel)
+    } else {
+        (&ctx.right_panel, &ctx.left_panel)
+    };
+    let entry = src
+        .entries
+        .get(src.selected)
+        .ok_or_else(|| anyhow::anyhow!("no selected entry"))?;
+    let session_id = ctx
+        .session_id
+        .ok_or_else(|| anyhow::anyhow!("no active session"))?;
+    let (source, dest) = match (src.kind, dst.kind) {
+        (PanelKind::Local, PanelKind::Remote) => (
+            TransferEndpoint::Local {
+                path: PathBuf::from(&src.path),
+            },
+            TransferEndpoint::Remote {
+                session_id,
+                path: dst.path.clone(),
+            },
+        ),
+        (PanelKind::Remote, PanelKind::Local) => (
+            TransferEndpoint::Remote {
+                session_id,
+                path: src.path.clone(),
+            },
+            TransferEndpoint::Local {
+                path: PathBuf::from(&dst.path),
+            },
+        ),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "copy_selected supports only local<->remote panels"
+            ))
+        }
+    };
+    let file = TransferFile {
+        source_path: join_path(&src.path, &entry.name, src.kind == PanelKind::Remote),
+        dest_path: join_path(&dst.path, &entry.name, dst.kind == PanelKind::Remote),
+        size: entry.size,
+        is_dir: entry.is_dir,
+    };
+    let job = TransferJob {
+        id: Uuid::new_v4(),
+        source,
+        dest,
+        files: vec![file],
+        options: TransferOptions {
+            overwrite: catsolle_core::transfer::OverwriteMode::Replace,
+            preserve_permissions: true,
+            preserve_times: true,
+            verify_checksum: ctx.config.transfer.verify_checksum,
+            resume: ctx.config.transfer.resume,
+            buffer_size: ctx.config.transfer.buffer_size,
+        },
+        state: TransferState::Queued,
+        progress: Default::default(),
+        created_at: chrono::Utc::now(),
+    };
+    let job_id = job.id;
+    ctx.queue
+        .enqueue(job)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    Ok(serde_json::to_string_pretty(&ToolTransferOutput {
+        job_id: job_id.to_string(),
+    })?)
+}
+
 async fn resolve_transfer_meta(
     source: &TransferEndpoint,
     path: &str,
@@ -4463,6 +5111,7 @@ fn tool_definitions() -> Vec<String> {
         "Tools:",
         "- local.exec {command, timeout_ms?}",
         "- remote.exec {command, timeout_ms?}",
+        "- remote.shell.exec {input, append_newline?, wait_ms?, timeout_ms?, max_bytes?}",
         "- local.list {path?, limit?, include_hidden?}",
         "- remote.list {path?, limit?, include_hidden?}",
         "- local.read {path, max_bytes?}",
@@ -4478,6 +5127,7 @@ fn tool_definitions() -> Vec<String> {
         "- local.rename {from, to}",
         "- remote.rename {from, to}",
         "- transfer.copy {source, dest}",
+        "- transfer.copy_selected {}",
         "- connections.list {}",
     ]
     .into_iter()
@@ -4852,5 +5502,60 @@ mod tests {
         let (cleaned, calls) = extract_tool_calls(input);
         assert_eq!(cleaned, input);
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parses_assistant_commands() {
+        assert_eq!(
+            parse_assistant_command("/agent on").unwrap(),
+            Some(AssistantCommand::Agent(true))
+        );
+        assert_eq!(
+            parse_assistant_command("/tools off").unwrap(),
+            Some(AssistantCommand::Tools(false))
+        );
+        assert_eq!(
+            parse_assistant_command("/auto on").unwrap(),
+            Some(AssistantCommand::Auto(true))
+        );
+        assert_eq!(
+            parse_assistant_command("/steps 7").unwrap(),
+            Some(AssistantCommand::Steps(7))
+        );
+        assert_eq!(
+            parse_assistant_command("/run").unwrap(),
+            Some(AssistantCommand::Run)
+        );
+        assert_eq!(parse_assistant_command("hello").unwrap(), None);
+    }
+
+    #[test]
+    fn reports_invalid_assistant_commands() {
+        assert_eq!(
+            parse_assistant_command("/agent").unwrap_err(),
+            AssistantCommandError::MissingValue
+        );
+        assert_eq!(
+            parse_assistant_command("/steps nope").unwrap_err(),
+            AssistantCommandError::InvalidValue
+        );
+        assert_eq!(
+            parse_assistant_command("/unknown").unwrap_err(),
+            AssistantCommandError::Unknown
+        );
+    }
+
+    #[test]
+    fn shell_log_trims_and_truncates() {
+        let mut log = ShellLog::new(5);
+        log.append(b"hello");
+        let slice = log.read_from(0, 2);
+        assert_eq!(slice.bytes, b"he");
+        assert!(slice.truncated);
+        assert!(!slice.trimmed);
+        log.append(b"world");
+        let slice = log.read_from(0, 10);
+        assert_eq!(slice.bytes, b"world");
+        assert!(slice.trimmed);
     }
 }
