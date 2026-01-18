@@ -78,6 +78,14 @@ pub struct TransferJob {
     pub created_at: DateTime<Utc>,
 }
 
+struct CopyContext<'a> {
+    cfg: &'a TransferConfig,
+    bus: &'a EventBus,
+    started_at: Instant,
+    last_emit: &'a mut Instant,
+    last_bytes: &'a mut u64,
+}
+
 #[derive(Clone)]
 pub struct TransferQueue {
     sender: mpsc::Sender<TransferJob>,
@@ -147,17 +155,16 @@ async fn process_job(
                     .open_sftp()
                     .await
                     .map_err(|e| CoreError::Ssh(e.to_string()))?;
-                copy_local_to_remote(
-                    job,
-                    &file,
-                    &sftp,
-                    cfg,
-                    bus,
-                    started_at,
-                    &mut last_emit,
-                    &mut last_bytes,
-                )
-                .await?;
+                {
+                    let mut ctx = CopyContext {
+                        cfg,
+                        bus,
+                        started_at,
+                        last_emit: &mut last_emit,
+                        last_bytes: &mut last_bytes,
+                    };
+                    copy_local_to_remote(job, &file, &sftp, &mut ctx).await?;
+                }
             }
             (TransferEndpoint::Remote { session_id, .. }, TransferEndpoint::Local { .. }) => {
                 let session = session_manager
@@ -168,29 +175,26 @@ async fn process_job(
                     .open_sftp()
                     .await
                     .map_err(|e| CoreError::Ssh(e.to_string()))?;
-                copy_remote_to_local(
-                    job,
-                    &file,
-                    &sftp,
-                    cfg,
-                    bus,
-                    started_at,
-                    &mut last_emit,
-                    &mut last_bytes,
-                )
-                .await?;
+                {
+                    let mut ctx = CopyContext {
+                        cfg,
+                        bus,
+                        started_at,
+                        last_emit: &mut last_emit,
+                        last_bytes: &mut last_bytes,
+                    };
+                    copy_remote_to_local(job, &file, &sftp, &mut ctx).await?;
+                }
             }
             (TransferEndpoint::Local { .. }, TransferEndpoint::Local { .. }) => {
-                copy_local_to_local(
-                    job,
-                    &file,
+                let mut ctx = CopyContext {
                     cfg,
                     bus,
                     started_at,
-                    &mut last_emit,
-                    &mut last_bytes,
-                )
-                .await?;
+                    last_emit: &mut last_emit,
+                    last_bytes: &mut last_bytes,
+                };
+                copy_local_to_local(job, &file, &mut ctx).await?;
             }
             _ => {
                 return Err(CoreError::Invalid(
@@ -209,11 +213,7 @@ async fn copy_local_to_remote(
     job: &mut TransferJob,
     file: &TransferFile,
     sftp: &SftpClient,
-    cfg: &TransferConfig,
-    bus: &EventBus,
-    started_at: Instant,
-    last_emit: &mut Instant,
-    last_bytes: &mut u64,
+    ctx: &mut CopyContext<'_>,
 ) -> Result<(), CoreError> {
     let src = PathBuf::from(&file.source_path);
     let dest = &file.dest_path;
@@ -230,7 +230,7 @@ async fn copy_local_to_remote(
         .await
         .map_err(|e| CoreError::Ssh(e.to_string()))?;
 
-    let mut buf = vec![0u8; cfg.buffer_size];
+    let mut buf = vec![0u8; ctx.cfg.buffer_size];
     let mut hasher = Sha256::new();
     loop {
         let n = local.read(&mut buf).await?;
@@ -245,7 +245,14 @@ async fn copy_local_to_remote(
             hasher.update(&buf[..n]);
         }
         job.progress.bytes_transferred += n as u64;
-        update_progress(job, bus, started_at, last_emit, last_bytes, false);
+        update_progress(
+            job,
+            ctx.bus,
+            ctx.started_at,
+            ctx.last_emit,
+            ctx.last_bytes,
+            false,
+        );
     }
 
     if job.options.verify_checksum {
@@ -263,11 +270,7 @@ async fn copy_remote_to_local(
     job: &mut TransferJob,
     file: &TransferFile,
     sftp: &SftpClient,
-    cfg: &TransferConfig,
-    bus: &EventBus,
-    started_at: Instant,
-    last_emit: &mut Instant,
-    last_bytes: &mut u64,
+    ctx: &mut CopyContext<'_>,
 ) -> Result<(), CoreError> {
     let dest = PathBuf::from(&file.dest_path);
     if file.is_dir {
@@ -284,7 +287,7 @@ async fn copy_remote_to_local(
         .await
         .map_err(|e| CoreError::Ssh(e.to_string()))?;
     let mut local = tokio::fs::File::create(&dest).await?;
-    let mut buf = vec![0u8; cfg.buffer_size];
+    let mut buf = vec![0u8; ctx.cfg.buffer_size];
     let mut hasher = Sha256::new();
 
     loop {
@@ -300,7 +303,14 @@ async fn copy_remote_to_local(
             hasher.update(&buf[..n]);
         }
         job.progress.bytes_transferred += n as u64;
-        update_progress(job, bus, started_at, last_emit, last_bytes, false);
+        update_progress(
+            job,
+            ctx.bus,
+            ctx.started_at,
+            ctx.last_emit,
+            ctx.last_bytes,
+            false,
+        );
     }
 
     if job.options.verify_checksum {
@@ -317,11 +327,7 @@ async fn copy_remote_to_local(
 async fn copy_local_to_local(
     job: &mut TransferJob,
     file: &TransferFile,
-    _cfg: &TransferConfig,
-    bus: &EventBus,
-    started_at: Instant,
-    last_emit: &mut Instant,
-    last_bytes: &mut u64,
+    ctx: &mut CopyContext<'_>,
 ) -> Result<(), CoreError> {
     let src = PathBuf::from(&file.source_path);
     let dest = PathBuf::from(&file.dest_path);
@@ -334,7 +340,14 @@ async fn copy_local_to_local(
     }
     let size = tokio::fs::copy(&src, &dest).await?;
     job.progress.bytes_transferred += size;
-    update_progress(job, bus, started_at, last_emit, last_bytes, true);
+    update_progress(
+        job,
+        ctx.bus,
+        ctx.started_at,
+        ctx.last_emit,
+        ctx.last_bytes,
+        true,
+    );
     Ok(())
 }
 

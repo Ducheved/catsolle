@@ -1,5 +1,5 @@
 use anyhow::Result;
-use catsolle_config::{AiConfig, AppConfig, I18n};
+use catsolle_config::{AiConfig, AppConfig, ConfigManager, I18n};
 use catsolle_core::{
     AuthMethod, Connection, ConnectionStore, Event as CoreEvent, EventBus, SessionManager,
     TransferEndpoint, TransferFile, TransferJob, TransferOptions, TransferProgress, TransferQueue,
@@ -14,7 +14,7 @@ use directories::UserDirs;
 use fluent_bundle::FluentArgs;
 use futures::{
     future::{pending, Either},
-    StreamExt,
+    StreamExt, TryStreamExt,
 };
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -22,21 +22,36 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use uuid::Uuid;
 use vt100::Parser;
+use walkdir::WalkDir;
 use zeroize::Zeroizing;
+
+struct AppRunContext {
+    store: ConnectionStore,
+    sessions: Arc<SessionManager>,
+    queue: TransferQueue,
+    bus: EventBus,
+    config_manager: ConfigManager,
+    config: AppConfig,
+    i18n: I18n,
+}
 
 pub async fn run(
     store: ConnectionStore,
     sessions: Arc<SessionManager>,
     queue: TransferQueue,
     bus: EventBus,
+    config_manager: ConfigManager,
     config: AppConfig,
     i18n: I18n,
 ) -> Result<()> {
@@ -46,7 +61,16 @@ pub async fn run(
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let res = run_app(&mut terminal, store, sessions, queue, bus, config, i18n).await;
+    let ctx = AppRunContext {
+        store,
+        sessions,
+        queue,
+        bus,
+        config_manager,
+        config,
+        i18n,
+    };
+    let res = run_app(&mut terminal, ctx).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -56,17 +80,21 @@ pub async fn run(
 
 async fn run_app(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
-    store: ConnectionStore,
-    sessions: Arc<SessionManager>,
-    queue: TransferQueue,
-    bus: EventBus,
-    config: AppConfig,
-    i18n: I18n,
+    ctx: AppRunContext,
 ) -> Result<()> {
     let mut event_stream = EventStream::new();
-    let mut event_rx = bus.subscribe();
+    let mut event_rx = ctx.bus.subscribe();
     let (assistant_tx, mut assistant_rx) = mpsc::channel::<AssistantEvent>(16);
-    let mut app = AppState::new(store, sessions, queue, config, i18n, assistant_tx).await?;
+    let mut app = AppState::new(
+        ctx.store,
+        ctx.sessions,
+        ctx.queue,
+        ctx.config_manager,
+        ctx.config,
+        ctx.i18n,
+        assistant_tx,
+    )
+    .await?;
 
     loop {
         terminal.draw(|f| app.draw(f))?;
@@ -115,6 +143,7 @@ struct AppState {
     store: ConnectionStore,
     sessions: Arc<SessionManager>,
     queue: TransferQueue,
+    config_manager: ConfigManager,
     config: AppConfig,
     i18n: I18n,
     theme: Theme,
@@ -135,6 +164,9 @@ struct AppState {
     status_message: Option<String>,
     transfer_status: Option<TransferStatus>,
     completed_transfers: HashSet<Uuid>,
+    pending_tools: VecDeque<ToolCall>,
+    tool_busy: bool,
+    agent_steps_remaining: u32,
     overlay: Overlay,
     active_connection: Option<Connection>,
     terminal_size: Option<(u16, u16)>,
@@ -202,6 +234,9 @@ enum Overlay {
         id: Uuid,
         state: PasswordOverlayState,
     },
+    AiSettings {
+        state: Box<AiSettingsState>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -225,6 +260,71 @@ struct PasswordOverlayState {
     mode: PasswordMode,
     error: Option<String>,
 }
+
+#[derive(Clone, Debug)]
+struct AiSettingsState {
+    selected: usize,
+    editing: bool,
+    input: String,
+    error: Option<String>,
+    draft: AiConfigDraft,
+}
+
+#[derive(Clone, Debug)]
+struct AiConfigDraft {
+    enabled: bool,
+    provider: String,
+    endpoint: String,
+    api_key: String,
+    model: String,
+    temperature: String,
+    max_tokens: String,
+    history_max: String,
+    timeout_ms: String,
+    streaming: bool,
+    agent_enabled: bool,
+    auto_mode: bool,
+    max_steps: String,
+    tools_enabled: bool,
+    system_prompt: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AiSettingsField {
+    Enabled,
+    Provider,
+    Endpoint,
+    ApiKey,
+    Model,
+    Temperature,
+    MaxTokens,
+    History,
+    Timeout,
+    Streaming,
+    Agent,
+    AutoMode,
+    MaxSteps,
+    Tools,
+    SystemPrompt,
+}
+
+const AI_SETTINGS_FIELDS: [AiSettingsField; 15] = [
+    AiSettingsField::Enabled,
+    AiSettingsField::Provider,
+    AiSettingsField::Endpoint,
+    AiSettingsField::ApiKey,
+    AiSettingsField::Model,
+    AiSettingsField::Temperature,
+    AiSettingsField::MaxTokens,
+    AiSettingsField::History,
+    AiSettingsField::Timeout,
+    AiSettingsField::Streaming,
+    AiSettingsField::Agent,
+    AiSettingsField::AutoMode,
+    AiSettingsField::MaxSteps,
+    AiSettingsField::Tools,
+    AiSettingsField::SystemPrompt,
+];
 
 #[derive(Clone, Debug)]
 struct PanelState {
@@ -254,6 +354,7 @@ struct AssistantState {
     messages: Vec<AssistantMessage>,
     scroll: usize,
     busy: bool,
+    stream_index: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -262,18 +363,35 @@ struct AssistantMessage {
     content: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct ToolCall {
+    name: String,
+    args: serde_json::Value,
+}
+
+#[derive(Clone, Debug)]
+struct ToolResult {
+    call: ToolCall,
+    success: bool,
+    output: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AssistantRole {
     User,
     Assistant,
     System,
     Error,
+    Tool,
 }
 
 #[derive(Clone, Debug)]
 enum AssistantEvent {
-    Response(String),
+    Start,
+    Delta(String),
+    Done(String),
     Error(String),
+    ToolResult(ToolResult),
 }
 
 #[derive(Clone, Debug)]
@@ -286,6 +404,7 @@ impl AppState {
         store: ConnectionStore,
         sessions: Arc<SessionManager>,
         queue: TransferQueue,
+        config_manager: ConfigManager,
         config: AppConfig,
         i18n: I18n,
         assistant_tx: mpsc::Sender<AssistantEvent>,
@@ -303,6 +422,7 @@ impl AppState {
             store,
             sessions,
             queue,
+            config_manager,
             config,
             i18n,
             theme: Theme::kawaii(),
@@ -323,6 +443,9 @@ impl AppState {
             status_message: None,
             transfer_status: None,
             completed_transfers: HashSet::new(),
+            pending_tools: VecDeque::new(),
+            tool_busy: false,
+            agent_steps_remaining: 0,
             overlay: Overlay::None,
             active_connection: None,
             terminal_size: None,
@@ -457,7 +580,11 @@ impl AppState {
     fn draw_ai_messages(&mut self, f: &mut ratatui::Frame<'_>, area: Rect) {
         let theme = self.theme;
         let title = if self.assistant.busy {
-            format!("{} · {}", self.i18n.tr("ai-title"), self.i18n.tr("status-ai-busy"))
+            format!(
+                "{} · {}",
+                self.i18n.tr("ai-title"),
+                self.i18n.tr("status-ai-busy")
+            )
         } else {
             self.i18n.tr("ai-title")
         };
@@ -507,7 +634,11 @@ impl AppState {
     fn draw_ai_input(&self, f: &mut ratatui::Frame<'_>, area: Rect) {
         let theme = self.theme;
         let active = matches!(self.input_focus, InputFocus::Assistant);
-        let border = if active { theme.accent_alt } else { theme.muted };
+        let border = if active {
+            theme.accent_alt
+        } else {
+            theme.muted
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .title(self.i18n.tr("ai-input-title"))
@@ -525,7 +656,10 @@ impl AppState {
         } else {
             Line::from(vec![
                 Span::styled("> ", Style::default().fg(theme.accent_alt)),
-                Span::styled(self.assistant.input.clone(), Style::default().fg(theme.text)),
+                Span::styled(
+                    self.assistant.input.clone(),
+                    Style::default().fg(theme.text),
+                ),
             ])
         };
         let paragraph = Paragraph::new(Text::from(text)).block(block);
@@ -598,10 +732,7 @@ impl AppState {
         )];
         if let Some(status) = self.header_status_line() {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                status,
-                Style::default().fg(theme.accent_soft),
-            ));
+            spans.push(Span::styled(status, Style::default().fg(theme.accent_soft)));
         }
         let block = Block::default()
             .borders(Borders::ALL)
@@ -742,6 +873,10 @@ impl AppState {
                 let area = centered_rect(70, 45, f.area());
                 self.draw_password_overlay(f, area, state);
             }
+            Overlay::AiSettings { state } => {
+                let area = centered_rect(80, 70, f.area());
+                self.draw_ai_settings_overlay(f, area, state);
+            }
         }
     }
 
@@ -756,6 +891,7 @@ impl AppState {
             Line::from(""),
             Line::from(self.i18n.tr("help-session")),
             Line::from(self.i18n.tr("help-assistant")),
+            Line::from(self.i18n.tr("help-ai-settings")),
             Line::from(""),
             Line::from(self.i18n.tr("help-quick-add")),
             Line::from(""),
@@ -906,12 +1042,69 @@ impl AppState {
         f.render_widget(paragraph, area);
     }
 
+    fn draw_ai_settings_overlay(
+        &self,
+        f: &mut ratatui::Frame<'_>,
+        area: Rect,
+        state: &AiSettingsState,
+    ) {
+        let theme = self.theme;
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(self.i18n.tr("ai-settings-title"))
+            .border_style(Style::default().fg(theme.accent));
+        let mut lines = Vec::new();
+        for (idx, field) in AI_SETTINGS_FIELDS.iter().enumerate() {
+            let label = self.ai_settings_label(*field);
+            let value = self.ai_settings_value(state, *field);
+            let active = idx == state.selected;
+            let label_style = if active {
+                Style::default()
+                    .fg(theme.accent_alt)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            let value_style = if active {
+                Style::default().fg(theme.accent)
+            } else {
+                Style::default().fg(theme.muted)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{label}: "), label_style),
+                Span::styled(value, value_style),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(self.i18n.tr("ai-settings-hint")));
+        if state.editing {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("> {}", state.input),
+                Style::default().fg(theme.accent_alt),
+            )));
+        }
+        if let Some(error) = state.error.as_deref() {
+            lines.push(Line::from(Span::styled(
+                error.to_string(),
+                Style::default().fg(theme.error),
+            )));
+        }
+        f.render_widget(Clear, area);
+        let paragraph = Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(theme.text));
+        f.render_widget(paragraph, area);
+    }
+
     fn footer_text(&self) -> Text<'_> {
         match &self.overlay {
             Overlay::QuickAdd { .. } => Text::from(self.i18n.tr("footer-quick-add")),
             Overlay::Edit { .. } => Text::from(self.i18n.tr("footer-edit")),
             Overlay::Password { .. } => Text::from(self.i18n.tr("footer-password")),
             Overlay::Help => Text::from(self.i18n.tr("footer-help")),
+            Overlay::AiSettings { .. } => Text::from(self.i18n.tr("footer-ai-settings")),
             Overlay::None => match self.mode {
                 AppMode::Connections => Text::from(self.i18n.tr("footer-connections")),
                 AppMode::Session { .. } => {
@@ -1006,6 +1199,13 @@ impl AppState {
                         .add_modifier(Modifier::BOLD),
                     Style::default().fg(theme.error),
                 ),
+                AssistantRole::Tool => (
+                    self.i18n.tr("ai-role-tool"),
+                    Style::default()
+                        .fg(theme.accent_alt)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.muted),
+                ),
             };
             let mut first = true;
             for line in message.content.lines() {
@@ -1016,16 +1216,18 @@ impl AppState {
                     ]));
                     first = false;
                 } else {
-                    lines.push(Line::from(Span::styled(
-                        line.to_string(),
-                        text_style,
-                    )));
+                    lines.push(Line::from(Span::styled(line.to_string(), text_style)));
                 }
             }
             lines.push(Line::from(""));
         }
         if lines.is_empty() {
             lines.push(Line::from(self.i18n.tr("ai-empty")));
+        }
+        if let Some(call) = self.pending_tools.front() {
+            let mut args = FluentArgs::new();
+            args.set("name", call.name.clone());
+            lines.push(Line::from(self.i18n.tr_args("ai-tool-pending", &args)));
         }
         lines
     }
@@ -1099,11 +1301,98 @@ impl AppState {
         if !self.show_ai_panel {
             return self.i18n.tr("status-ai-off");
         }
-        if self.assistant.busy {
-            self.i18n.tr("status-ai-busy")
-        } else {
-            self.i18n.tr("status-ai-on")
+        if self.assistant.busy || self.tool_busy {
+            return self.i18n.tr("status-ai-busy");
         }
+        let mut parts = vec![self.i18n.tr("status-ai-on")];
+        if self.config.ai.tools_enabled {
+            parts.push(self.i18n.tr("status-ai-tools"));
+        }
+        if self.config.ai.agent_enabled {
+            parts.push(self.i18n.tr("status-ai-agent"));
+        }
+        if self.config.ai.auto_mode {
+            parts.push(self.i18n.tr("status-ai-auto"));
+        }
+        if self.config.ai.streaming {
+            parts.push(self.i18n.tr("status-ai-stream"));
+        }
+        parts.join(" ")
+    }
+
+    fn ai_settings_label(&self, field: AiSettingsField) -> String {
+        match field {
+            AiSettingsField::Enabled => self.i18n.tr("ai-settings-enabled"),
+            AiSettingsField::Provider => self.i18n.tr("ai-settings-provider"),
+            AiSettingsField::Endpoint => self.i18n.tr("ai-settings-endpoint"),
+            AiSettingsField::ApiKey => self.i18n.tr("ai-settings-api-key"),
+            AiSettingsField::Model => self.i18n.tr("ai-settings-model"),
+            AiSettingsField::Temperature => self.i18n.tr("ai-settings-temperature"),
+            AiSettingsField::MaxTokens => self.i18n.tr("ai-settings-max-tokens"),
+            AiSettingsField::History => self.i18n.tr("ai-settings-history"),
+            AiSettingsField::Timeout => self.i18n.tr("ai-settings-timeout"),
+            AiSettingsField::Streaming => self.i18n.tr("ai-settings-streaming"),
+            AiSettingsField::Agent => self.i18n.tr("ai-settings-agent"),
+            AiSettingsField::AutoMode => self.i18n.tr("ai-settings-auto"),
+            AiSettingsField::MaxSteps => self.i18n.tr("ai-settings-max-steps"),
+            AiSettingsField::Tools => self.i18n.tr("ai-settings-tools"),
+            AiSettingsField::SystemPrompt => self.i18n.tr("ai-settings-system"),
+        }
+    }
+
+    fn ai_settings_value(&self, state: &AiSettingsState, field: AiSettingsField) -> String {
+        match field {
+            AiSettingsField::Enabled => self.bool_label(state.draft.enabled),
+            AiSettingsField::Provider => self.provider_label(&state.draft.provider),
+            AiSettingsField::Endpoint => state.draft.endpoint.clone(),
+            AiSettingsField::ApiKey => self.mask_value(&state.draft.api_key),
+            AiSettingsField::Model => state.draft.model.clone(),
+            AiSettingsField::Temperature => state.draft.temperature.clone(),
+            AiSettingsField::MaxTokens => state.draft.max_tokens.clone(),
+            AiSettingsField::History => state.draft.history_max.clone(),
+            AiSettingsField::Timeout => state.draft.timeout_ms.clone(),
+            AiSettingsField::Streaming => self.bool_label(state.draft.streaming),
+            AiSettingsField::Agent => self.bool_label(state.draft.agent_enabled),
+            AiSettingsField::AutoMode => self.bool_label(state.draft.auto_mode),
+            AiSettingsField::MaxSteps => state.draft.max_steps.clone(),
+            AiSettingsField::Tools => self.bool_label(state.draft.tools_enabled),
+            AiSettingsField::SystemPrompt => self.truncate_text(&state.draft.system_prompt, 80),
+        }
+    }
+
+    fn bool_label(&self, value: bool) -> String {
+        if value {
+            self.i18n.tr("value-on")
+        } else {
+            self.i18n.tr("value-off")
+        }
+    }
+
+    fn provider_label(&self, value: &str) -> String {
+        match value.trim().to_lowercase().as_str() {
+            "ollama" => self.i18n.tr("ai-settings-provider-ollama"),
+            "openai" | "openai-compatible" => self.i18n.tr("ai-settings-provider-openai"),
+            "openrouter" => self.i18n.tr("ai-settings-provider-openrouter"),
+            "anthropic" => self.i18n.tr("ai-settings-provider-anthropic"),
+            _ => value.to_string(),
+        }
+    }
+
+    fn mask_value(&self, value: &str) -> String {
+        if value.trim().is_empty() {
+            "".to_string()
+        } else {
+            "*".repeat(value.chars().count().min(24))
+        }
+    }
+
+    fn truncate_text(&self, value: &str, max: usize) -> String {
+        let count = value.chars().count();
+        if count <= max {
+            return value.to_string();
+        }
+        let trimmed: String = value.chars().take(max.saturating_sub(3)).collect();
+        format!("{trimmed}...")
     }
 
     fn ai_config_error(&self) -> Option<String> {
@@ -1111,7 +1400,12 @@ impl AppState {
             return None;
         }
         let provider = self.config.ai.provider.trim().to_lowercase();
-        if provider != "ollama" && provider != "openai-compatible" && provider != "openai" {
+        if provider != "ollama"
+            && provider != "openai"
+            && provider != "openai-compatible"
+            && provider != "openrouter"
+            && provider != "anthropic"
+        {
             return Some(self.i18n.tr("ai-config-provider"));
         }
         if self.config.ai.endpoint.trim().is_empty() {
@@ -1120,7 +1414,10 @@ impl AppState {
         if self.config.ai.model.trim().is_empty() {
             return Some(self.i18n.tr("ai-config-model"));
         }
-        if (provider == "openai-compatible" || provider == "openai")
+        if (provider == "openai"
+            || provider == "openai-compatible"
+            || provider == "openrouter"
+            || provider == "anthropic")
             && self
                 .config
                 .ai
@@ -1134,17 +1431,85 @@ impl AppState {
         None
     }
 
+    fn apply_ai_settings(&mut self, state: &mut AiSettingsState) -> Result<()> {
+        let temperature: f32 = state
+            .draft
+            .temperature
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!(self.i18n.tr("ai-settings-error-number")))?;
+        let max_tokens: u32 = state
+            .draft
+            .max_tokens
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!(self.i18n.tr("ai-settings-error-number")))?;
+        let history_max: usize = state
+            .draft
+            .history_max
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!(self.i18n.tr("ai-settings-error-number")))?;
+        let timeout_ms: u64 = state
+            .draft
+            .timeout_ms
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!(self.i18n.tr("ai-settings-error-number")))?;
+        let max_steps: u32 = state
+            .draft
+            .max_steps
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!(self.i18n.tr("ai-settings-error-number")))?;
+        self.config.ai.enabled = state.draft.enabled;
+        self.config.ai.provider = state.draft.provider.trim().to_string();
+        self.config.ai.endpoint = state.draft.endpoint.trim().to_string();
+        self.config.ai.api_key = if state.draft.api_key.trim().is_empty() {
+            None
+        } else {
+            Some(state.draft.api_key.clone())
+        };
+        self.config.ai.model = state.draft.model.trim().to_string();
+        self.config.ai.temperature = temperature;
+        self.config.ai.max_tokens = max_tokens;
+        self.config.ai.history_max = history_max;
+        self.config.ai.timeout_ms = timeout_ms;
+        self.config.ai.system_prompt = state.draft.system_prompt.clone();
+        self.config.ai.streaming = state.draft.streaming;
+        self.config.ai.agent_enabled = state.draft.agent_enabled;
+        self.config.ai.auto_mode = state.draft.auto_mode;
+        self.config.ai.max_steps = max_steps;
+        self.config.ai.tools_enabled = state.draft.tools_enabled;
+        if !self.config.ai.tools_enabled {
+            self.pending_tools.clear();
+            self.tool_busy = false;
+        }
+        self.rebuild_ai_client()?;
+        self.config_manager.save_config(&self.config)?;
+        Ok(())
+    }
+
+    fn rebuild_ai_client(&mut self) -> Result<()> {
+        let mut builder = reqwest::Client::builder();
+        if self.config.ai.timeout_ms > 0 {
+            builder = builder.timeout(Duration::from_millis(self.config.ai.timeout_ms));
+        }
+        self.ai_client = builder.build()?;
+        Ok(())
+    }
+
     async fn handle_bus_event(&mut self, event: CoreEvent) -> Result<()> {
         if let CoreEvent::TransferProgress { job_id, progress } = event {
             self.transfer_status = Some(TransferStatus {
                 progress: progress.clone(),
             });
-            if progress.files_total > 0 && progress.files_completed >= progress.files_total {
-                if self.completed_transfers.insert(job_id) {
-                    if matches!(self.mode, AppMode::Session { .. }) {
-                        self.refresh_panels().await?;
-                    }
-                }
+            if progress.files_total > 0
+                && progress.files_completed >= progress.files_total
+                && self.completed_transfers.insert(job_id)
+                && matches!(self.mode, AppMode::Session { .. })
+            {
+                self.refresh_panels().await?;
             }
         }
         Ok(())
@@ -1269,6 +1634,13 @@ impl AppState {
                 error: None,
             };
         }
+    }
+
+    fn open_ai_settings(&mut self) {
+        let state = AiSettingsState::from_config(&self.config.ai);
+        self.overlay = Overlay::AiSettings {
+            state: Box::new(state),
+        };
     }
 
     fn save_edit_connection(&mut self, id: Uuid, input: &str) -> Result<(), String> {
@@ -1504,7 +1876,7 @@ impl AppState {
                     }
                     KeyCode::Enter => match self.quick_add_connection(&input) {
                         Ok(_) => close = true,
-                        Err(err) => error = Some(err),
+                        Err(err) => error = Some(err.to_string()),
                     },
                     KeyCode::Backspace => {
                         input.pop();
@@ -1535,7 +1907,7 @@ impl AppState {
                     }
                     KeyCode::Enter => match self.save_edit_connection(id, &input) {
                         Ok(_) => close = true,
-                        Err(err) => error = Some(err),
+                        Err(err) => error = Some(err.to_string()),
                     },
                     KeyCode::Backspace => {
                         input.pop();
@@ -1586,7 +1958,7 @@ impl AppState {
                                         master_opt,
                                     ) {
                                         Ok(_) => close = true,
-                                        Err(err) => state.error = Some(err),
+                                        Err(err) => state.error = Some(err.to_string()),
                                     }
                                 }
                                 PasswordMode::Connect => {
@@ -1600,7 +1972,7 @@ impl AppState {
                                         .await
                                     {
                                         Ok(_) => close = true,
-                                        Err(err) => state.error = Some(err),
+                                        Err(err) => state.error = Some(err.to_string()),
                                     }
                                 }
                             }
@@ -1631,6 +2003,114 @@ impl AppState {
                 }
                 Ok(false)
             }
+            Overlay::AiSettings { mut state } => {
+                let mut close = false;
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('s'))
+                {
+                    match self.apply_ai_settings(&mut state) {
+                        Ok(_) => {
+                            self.set_status(self.i18n.tr("ai-settings-saved"));
+                            close = true;
+                        }
+                        Err(err) => {
+                            state.error = Some(err.to_string());
+                        }
+                    }
+                } else if state.editing {
+                    match key.code {
+                        KeyCode::Esc => {
+                            state.editing = false;
+                            state.input.clear();
+                        }
+                        KeyCode::Enter => {
+                            let field = state.selected_field();
+                            state.commit_edit(field);
+                        }
+                        KeyCode::Backspace => {
+                            state.input.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                                state.input.push(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Esc => {
+                            close = true;
+                        }
+                        KeyCode::Up => {
+                            if state.selected == 0 {
+                                state.selected = AI_SETTINGS_FIELDS.len().saturating_sub(1);
+                            } else {
+                                state.selected = state.selected.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::Down => {
+                            state.selected = (state.selected + 1) % AI_SETTINGS_FIELDS.len();
+                        }
+                        KeyCode::Left => {
+                            let field = state.selected_field();
+                            if field == AiSettingsField::Provider {
+                                let next = cycle_provider(&state.draft.provider, -1);
+                                let (endpoint, model) = provider_defaults(&next);
+                                state.draft.provider = next;
+                                state.draft.endpoint = endpoint;
+                                state.draft.model = model;
+                            } else {
+                                state.toggle_field(field);
+                            }
+                        }
+                        KeyCode::Right => {
+                            let field = state.selected_field();
+                            if field == AiSettingsField::Provider {
+                                let next = cycle_provider(&state.draft.provider, 1);
+                                let (endpoint, model) = provider_defaults(&next);
+                                state.draft.provider = next;
+                                state.draft.endpoint = endpoint;
+                                state.draft.model = model;
+                            } else {
+                                state.toggle_field(field);
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let field = state.selected_field();
+                            if field == AiSettingsField::Provider {
+                                let next = cycle_provider(&state.draft.provider, 1);
+                                let (endpoint, model) = provider_defaults(&next);
+                                state.draft.provider = next;
+                                state.draft.endpoint = endpoint;
+                                state.draft.model = model;
+                            } else if matches!(
+                                field,
+                                AiSettingsField::Enabled
+                                    | AiSettingsField::Streaming
+                                    | AiSettingsField::Agent
+                                    | AiSettingsField::AutoMode
+                                    | AiSettingsField::Tools
+                            ) {
+                                state.toggle_field(field);
+                            } else {
+                                state.start_edit(field);
+                            }
+                        }
+                        KeyCode::Char(' ') => {
+                            let field = state.selected_field();
+                            state.toggle_field(field);
+                        }
+                        _ => {}
+                    }
+                }
+                if close {
+                    self.overlay = Overlay::None;
+                } else {
+                    self.overlay = Overlay::AiSettings { state };
+                }
+                Ok(false)
+            }
             Overlay::None => Ok(false),
         }
     }
@@ -1651,6 +2131,10 @@ impl AppState {
                         input: String::new(),
                         error: None,
                     };
+                    Ok(false)
+                }
+                'a' => {
+                    self.open_ai_settings();
                     Ok(false)
                 }
                 'e' => {
@@ -1693,12 +2177,20 @@ impl AppState {
                 }
                 Ok(false)
             }
+            KeyCode::F(9) => {
+                self.open_ai_settings();
+                Ok(false)
+            }
             _ => Ok(false),
         }
     }
 
     async fn handle_session_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
+            KeyCode::F(9) => {
+                self.open_ai_settings();
+                return Ok(false);
+            }
             KeyCode::F(10) => {
                 self.toggle_ai_panel();
                 return Ok(false);
@@ -1732,6 +2224,9 @@ impl AppState {
                 self.mode = AppMode::Connections;
                 self.shell = None;
                 self.active_connection = None;
+                self.pending_tools.clear();
+                self.tool_busy = false;
+                self.agent_steps_remaining = 0;
                 Ok(false)
             }
             KeyCode::Char('?') => {
@@ -1784,6 +2279,28 @@ impl AppState {
     }
 
     async fn handle_assistant_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('y') => {
+                    if !self.pending_tools.is_empty() {
+                        self.start_next_tool();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('n') => {
+                    if let Some(skipped) = self.pending_tools.pop_front() {
+                        let mut args = FluentArgs::new();
+                        args.set("name", skipped.name);
+                        self.set_status(self.i18n.tr_args("ai-tool-skipped", &args));
+                        if self.config.ai.auto_mode {
+                            self.start_next_tool();
+                        }
+                    }
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => {
                 self.exit_assistant_focus();
@@ -1930,14 +2447,31 @@ impl AppState {
             self.config.ai.history_max,
         );
         let messages = self.build_ai_request_messages();
+        if self.config.ai.agent_enabled {
+            self.agent_steps_remaining = self.config.ai.max_steps;
+        } else {
+            self.agent_steps_remaining = 0;
+        }
+        self.start_ai_request(messages);
+    }
+
+    fn start_ai_request(&mut self, messages: Vec<ChatMessage>) {
+        if self.config.ai.agent_enabled && self.agent_steps_remaining > 0 {
+            self.agent_steps_remaining = self.agent_steps_remaining.saturating_sub(1);
+        }
         let cfg = self.config.ai.clone();
         let client = self.ai_client.clone();
         let tx = self.assistant_tx.clone();
         self.assistant.busy = true;
         tokio::spawn(async move {
-            let result = request_ai(client, &cfg, messages).await;
+            let _ = tx.send(AssistantEvent::Start).await;
+            let result = if cfg.streaming {
+                request_ai_stream(client, &cfg, messages, tx.clone()).await
+            } else {
+                request_ai(client, &cfg, messages).await
+            };
             let event = match result {
-                Ok(content) => AssistantEvent::Response(content),
+                Ok(content) => AssistantEvent::Done(content),
                 Err(err) => AssistantEvent::Error(err.to_string()),
             };
             let _ = tx.send(event).await;
@@ -1957,7 +2491,12 @@ impl AppState {
             .assistant
             .messages
             .iter()
-            .filter(|m| matches!(m.role, AssistantRole::User | AssistantRole::Assistant))
+            .filter(|m| {
+                matches!(
+                    m.role,
+                    AssistantRole::User | AssistantRole::Assistant | AssistantRole::Tool
+                )
+            })
             .collect();
         let max = self.config.ai.history_max;
         let start = if max > 0 && history.len() > max {
@@ -1969,6 +2508,7 @@ impl AppState {
             let role = match message.role {
                 AssistantRole::User => "user",
                 AssistantRole::Assistant => "assistant",
+                AssistantRole::Tool => "user",
                 _ => "user",
             };
             out.push(ChatMessage {
@@ -1989,22 +2529,68 @@ impl AppState {
         }
         prompt.push_str(&format!("\nLocal path: {}", self.left_panel.path));
         prompt.push_str(&format!("\nRemote path: {}", self.right_panel.path));
+        if self.config.ai.tools_enabled {
+            for line in tool_definitions() {
+                prompt.push('\n');
+                prompt.push_str(&line);
+            }
+        }
         prompt
     }
 
     fn handle_assistant_event(&mut self, event: AssistantEvent) {
-        self.assistant.busy = false;
         match event {
-            AssistantEvent::Response(content) => {
+            AssistantEvent::Start => {
+                self.assistant.busy = true;
                 self.assistant.push_message(
                     AssistantMessage {
                         role: AssistantRole::Assistant,
-                        content,
+                        content: String::new(),
                     },
                     self.config.ai.history_max,
                 );
+                self.assistant.stream_index = Some(self.assistant.messages.len().saturating_sub(1));
+            }
+            AssistantEvent::Delta(chunk) => {
+                if let Some(idx) = self.assistant.stream_index {
+                    if let Some(message) = self.assistant.messages.get_mut(idx) {
+                        message.content.push_str(&chunk);
+                    }
+                }
+                self.assistant.scroll = usize::MAX;
+            }
+            AssistantEvent::Done(content) => {
+                self.assistant.busy = false;
+                let (cleaned, calls) = extract_tool_calls(&content);
+                if let Some(idx) = self.assistant.stream_index {
+                    if let Some(message) = self.assistant.messages.get_mut(idx) {
+                        message.content = cleaned.clone();
+                    }
+                } else {
+                    self.assistant.push_message(
+                        AssistantMessage {
+                            role: AssistantRole::Assistant,
+                            content: cleaned.clone(),
+                        },
+                        self.config.ai.history_max,
+                    );
+                }
+                if self.config.ai.tools_enabled && !calls.is_empty() {
+                    self.pending_tools.extend(calls);
+                    if let Some(next) = self.pending_tools.front() {
+                        let mut args = FluentArgs::new();
+                        args.set("name", next.name.clone());
+                        self.set_status(self.i18n.tr_args("ai-tool-pending", &args));
+                    }
+                    if self.config.ai.auto_mode {
+                        self.start_next_tool();
+                    }
+                }
+                self.assistant.stream_index = None;
             }
             AssistantEvent::Error(error) => {
+                self.assistant.busy = false;
+                self.assistant.stream_index = None;
                 let mut args = FluentArgs::new();
                 args.set("error", error);
                 self.assistant.push_message(
@@ -2015,7 +2601,80 @@ impl AppState {
                     self.config.ai.history_max,
                 );
             }
+            AssistantEvent::ToolResult(result) => {
+                self.tool_busy = false;
+                let status_key = if result.success {
+                    "ai-tool-approved"
+                } else {
+                    "ai-tool-error"
+                };
+                if result.success {
+                    self.set_status(self.i18n.tr(status_key));
+                } else {
+                    let mut args = FluentArgs::new();
+                    args.set("error", result.output.clone());
+                    self.set_status(self.i18n.tr_args(status_key, &args));
+                }
+                let content = format!("Tool result ({})\n{}", result.call.name, result.output);
+                self.assistant.push_message(
+                    AssistantMessage {
+                        role: AssistantRole::Tool,
+                        content,
+                    },
+                    self.config.ai.history_max,
+                );
+                if !self.pending_tools.is_empty() {
+                    if self.config.ai.auto_mode {
+                        self.start_next_tool();
+                    }
+                } else if self.config.ai.agent_enabled && self.agent_steps_remaining > 0 {
+                    self.start_agent_followup();
+                }
+            }
         }
+    }
+
+    fn start_agent_followup(&mut self) {
+        if !self.config.ai.enabled || self.assistant.busy || self.tool_busy {
+            return;
+        }
+        let messages = self.build_ai_request_messages();
+        self.start_ai_request(messages);
+    }
+
+    fn start_next_tool(&mut self) {
+        if self.tool_busy || !self.config.ai.tools_enabled {
+            return;
+        }
+        let Some(call) = self.pending_tools.pop_front() else {
+            return;
+        };
+        self.tool_busy = true;
+        self.set_status(self.i18n.tr("ai-tool-running"));
+        let tx = self.assistant_tx.clone();
+        let sessions = self.sessions.clone();
+        let queue = self.queue.clone();
+        let config = self.config.clone();
+        let local_base = self.left_panel.path.clone();
+        let remote_base = self.right_panel.path.clone();
+        let session_id = match self.mode {
+            AppMode::Session { id } => Some(id),
+            _ => None,
+        };
+        let connections = self.connections.clone();
+        tokio::spawn(async move {
+            let ctx = ToolContext {
+                sessions,
+                queue,
+                config,
+                local_base,
+                remote_base,
+                session_id,
+                connections,
+            };
+            let result = execute_tool_call(call, ctx).await;
+            let _ = tx.send(AssistantEvent::ToolResult(result)).await;
+        });
     }
 
     async fn enter_session(&mut self, session_id: Uuid, conn: Connection) -> Result<()> {
@@ -2024,6 +2683,9 @@ impl AppState {
         self.input_focus = InputFocus::Files;
         self.transfer_status = None;
         self.assistant = AssistantState::new(&self.i18n);
+        self.pending_tools.clear();
+        self.tool_busy = false;
+        self.agent_steps_remaining = 0;
         self.ensure_focus_valid();
         if let Some(handle) = self.sessions.get_session(session_id) {
             let shell = handle
@@ -2172,6 +2834,7 @@ impl AssistantState {
             }],
             scroll: 0,
             busy: false,
+            stream_index: None,
         }
     }
 
@@ -2182,6 +2845,87 @@ impl AssistantState {
             self.messages.drain(0..excess);
         }
         self.scroll = usize::MAX;
+    }
+}
+
+impl AiSettingsState {
+    fn from_config(cfg: &AiConfig) -> Self {
+        Self {
+            selected: 0,
+            editing: false,
+            input: String::new(),
+            error: None,
+            draft: AiConfigDraft {
+                enabled: cfg.enabled,
+                provider: cfg.provider.clone(),
+                endpoint: cfg.endpoint.clone(),
+                api_key: cfg.api_key.clone().unwrap_or_default(),
+                model: cfg.model.clone(),
+                temperature: cfg.temperature.to_string(),
+                max_tokens: cfg.max_tokens.to_string(),
+                history_max: cfg.history_max.to_string(),
+                timeout_ms: cfg.timeout_ms.to_string(),
+                streaming: cfg.streaming,
+                agent_enabled: cfg.agent_enabled,
+                auto_mode: cfg.auto_mode,
+                max_steps: cfg.max_steps.to_string(),
+                tools_enabled: cfg.tools_enabled,
+                system_prompt: cfg.system_prompt.clone(),
+            },
+        }
+    }
+
+    fn selected_field(&self) -> AiSettingsField {
+        AI_SETTINGS_FIELDS
+            .get(self.selected)
+            .copied()
+            .unwrap_or(AiSettingsField::Enabled)
+    }
+
+    fn start_edit(&mut self, field: AiSettingsField) {
+        self.editing = true;
+        self.error = None;
+        self.input = match field {
+            AiSettingsField::Endpoint => self.draft.endpoint.clone(),
+            AiSettingsField::ApiKey => self.draft.api_key.clone(),
+            AiSettingsField::Model => self.draft.model.clone(),
+            AiSettingsField::Temperature => self.draft.temperature.clone(),
+            AiSettingsField::MaxTokens => self.draft.max_tokens.clone(),
+            AiSettingsField::History => self.draft.history_max.clone(),
+            AiSettingsField::Timeout => self.draft.timeout_ms.clone(),
+            AiSettingsField::MaxSteps => self.draft.max_steps.clone(),
+            AiSettingsField::SystemPrompt => self.draft.system_prompt.clone(),
+            _ => String::new(),
+        };
+    }
+
+    fn commit_edit(&mut self, field: AiSettingsField) {
+        let value = self.input.clone();
+        match field {
+            AiSettingsField::Endpoint => self.draft.endpoint = value,
+            AiSettingsField::ApiKey => self.draft.api_key = value,
+            AiSettingsField::Model => self.draft.model = value,
+            AiSettingsField::Temperature => self.draft.temperature = value,
+            AiSettingsField::MaxTokens => self.draft.max_tokens = value,
+            AiSettingsField::History => self.draft.history_max = value,
+            AiSettingsField::Timeout => self.draft.timeout_ms = value,
+            AiSettingsField::MaxSteps => self.draft.max_steps = value,
+            AiSettingsField::SystemPrompt => self.draft.system_prompt = value,
+            _ => {}
+        }
+        self.editing = false;
+        self.input.clear();
+    }
+
+    fn toggle_field(&mut self, field: AiSettingsField) {
+        match field {
+            AiSettingsField::Enabled => self.draft.enabled = !self.draft.enabled,
+            AiSettingsField::Streaming => self.draft.streaming = !self.draft.streaming,
+            AiSettingsField::Agent => self.draft.agent_enabled = !self.draft.agent_enabled,
+            AiSettingsField::AutoMode => self.draft.auto_mode = !self.draft.auto_mode,
+            AiSettingsField::Tools => self.draft.tools_enabled = !self.draft.tools_enabled,
+            _ => {}
+        }
     }
 }
 
@@ -2372,6 +3116,7 @@ struct OpenAiRequest {
     messages: Vec<ChatMessage>,
     temperature: f32,
     max_tokens: u32,
+    stream: bool,
 }
 
 #[derive(Deserialize)]
@@ -2387,6 +3132,21 @@ struct OpenAiChoice {
 #[derive(Deserialize)]
 struct OpenAiMessage {
     content: String,
+}
+
+#[derive(Deserialize)]
+struct OpenAiStreamResponse {
+    choices: Vec<OpenAiStreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiStreamChoice {
+    delta: OpenAiStreamDelta,
+}
+
+#[derive(Deserialize)]
+struct OpenAiStreamDelta {
+    content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2413,18 +3173,84 @@ struct OllamaMessage {
     content: String,
 }
 
+#[derive(Deserialize)]
+struct OllamaStreamChunk {
+    message: Option<OllamaMessage>,
+    done: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct AnthropicRequest {
+    model: String,
+    max_tokens: u32,
+    temperature: f32,
+    messages: Vec<ChatMessage>,
+    system: Option<String>,
+    stream: bool,
+}
+
+#[derive(Deserialize)]
+struct AnthropicResponse {
+    content: Vec<AnthropicContent>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicContent {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct AnthropicStreamChunk {
+    #[serde(rename = "type")]
+    kind: String,
+    delta: Option<AnthropicDelta>,
+    content_block: Option<AnthropicContentBlock>,
+    error: Option<AnthropicError>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicDelta {
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicContentBlock {
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicError {
+    message: String,
+}
+
+async fn request_ai_stream(
+    client: reqwest::Client,
+    cfg: &AiConfig,
+    messages: Vec<ChatMessage>,
+    tx: mpsc::Sender<AssistantEvent>,
+) -> Result<String> {
+    let provider = cfg.provider.trim().to_lowercase();
+    match provider.as_str() {
+        "ollama" => request_ollama_stream(client, cfg, messages, tx).await,
+        "openai" | "openai-compatible" => request_openai_stream(client, cfg, messages, tx).await,
+        "openrouter" => request_openai_stream(client, cfg, messages, tx).await,
+        "anthropic" => request_anthropic_stream(client, cfg, messages, tx).await,
+        _ => Err(anyhow::anyhow!("unknown ai provider: {}", cfg.provider)),
+    }
+}
+
 async fn request_ai(
     client: reqwest::Client,
     cfg: &AiConfig,
     messages: Vec<ChatMessage>,
 ) -> Result<String> {
     let provider = cfg.provider.trim().to_lowercase();
-    if provider == "ollama" {
-        request_ollama(client, cfg, messages).await
-    } else if provider == "openai-compatible" || provider == "openai" {
-        request_openai(client, cfg, messages).await
-    } else {
-        Err(anyhow::anyhow!("unknown ai provider: {}", cfg.provider))
+    match provider.as_str() {
+        "ollama" => request_ollama(client, cfg, messages).await,
+        "openai" | "openai-compatible" => request_openai(client, cfg, messages).await,
+        "openrouter" => request_openai(client, cfg, messages).await,
+        "anthropic" => request_anthropic(client, cfg, messages).await,
+        _ => Err(anyhow::anyhow!("unknown ai provider: {}", cfg.provider)),
     }
 }
 
@@ -2457,20 +3283,63 @@ async fn request_ollama(
     Ok(content)
 }
 
+async fn request_ollama_stream(
+    client: reqwest::Client,
+    cfg: &AiConfig,
+    messages: Vec<ChatMessage>,
+    tx: mpsc::Sender<AssistantEvent>,
+) -> Result<String> {
+    let url = format!("{}/api/chat", cfg.endpoint.trim_end_matches('/'));
+    let body = OllamaRequest {
+        model: cfg.model.clone(),
+        messages,
+        stream: true,
+        options: OllamaOptions {
+            temperature: cfg.temperature,
+            num_predict: cfg.max_tokens,
+        },
+    };
+    let resp = client.post(url).json(&body).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("ollama error {status}: {text}"));
+    }
+    let mut out = String::new();
+    let stream = resp.bytes_stream().map_err(io::Error::other);
+    let reader = tokio_util::io::StreamReader::new(stream);
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let chunk: OllamaStreamChunk = serde_json::from_str(line)?;
+        if let Some(message) = chunk.message {
+            if !message.content.is_empty() {
+                out.push_str(&message.content);
+                let _ = tx.send(AssistantEvent::Delta(message.content)).await;
+            }
+        }
+        if chunk.done.unwrap_or(false) {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 async fn request_openai(
     client: reqwest::Client,
     cfg: &AiConfig,
     messages: Vec<ChatMessage>,
 ) -> Result<String> {
-    let url = format!(
-        "{}/v1/chat/completions",
-        cfg.endpoint.trim_end_matches('/')
-    );
+    let url = format!("{}/v1/chat/completions", cfg.endpoint.trim_end_matches('/'));
     let body = OpenAiRequest {
         model: cfg.model.clone(),
         messages,
         temperature: cfg.temperature,
         max_tokens: cfg.max_tokens,
+        stream: false,
     };
     let mut req = client.post(url).json(&body);
     if let Some(key) = cfg.api_key.as_ref().filter(|v| !v.trim().is_empty()) {
@@ -2489,6 +3358,950 @@ async fn request_openai(
         .map(|c| c.message.content.clone())
         .ok_or_else(|| anyhow::anyhow!("ai empty response"))?;
     Ok(content)
+}
+
+async fn request_openai_stream(
+    client: reqwest::Client,
+    cfg: &AiConfig,
+    messages: Vec<ChatMessage>,
+    tx: mpsc::Sender<AssistantEvent>,
+) -> Result<String> {
+    let url = format!("{}/v1/chat/completions", cfg.endpoint.trim_end_matches('/'));
+    let body = OpenAiRequest {
+        model: cfg.model.clone(),
+        messages,
+        temperature: cfg.temperature,
+        max_tokens: cfg.max_tokens,
+        stream: true,
+    };
+    let mut req = client.post(url).json(&body);
+    if let Some(key) = cfg.api_key.as_ref().filter(|v| !v.trim().is_empty()) {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("ai error {status}: {text}"));
+    }
+    let mut out = String::new();
+    let stream = resp.bytes_stream().map_err(io::Error::other);
+    let reader = tokio_util::io::StreamReader::new(stream);
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with("data:") {
+            continue;
+        }
+        let data = line.trim_start_matches("data:").trim();
+        if data == "[DONE]" {
+            break;
+        }
+        let chunk: OpenAiStreamResponse = serde_json::from_str(data)?;
+        if let Some(delta) = chunk.choices.first().and_then(|c| c.delta.content.clone()) {
+            if !delta.is_empty() {
+                out.push_str(&delta);
+                let _ = tx.send(AssistantEvent::Delta(delta)).await;
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn request_anthropic(
+    client: reqwest::Client,
+    cfg: &AiConfig,
+    messages: Vec<ChatMessage>,
+) -> Result<String> {
+    let url = format!("{}/v1/messages", cfg.endpoint.trim_end_matches('/'));
+    let (system, messages) = split_system_prompt(messages);
+    let body = AnthropicRequest {
+        model: cfg.model.clone(),
+        max_tokens: cfg.max_tokens,
+        temperature: cfg.temperature,
+        messages,
+        system,
+        stream: false,
+    };
+    let mut req = client.post(url).json(&body);
+    if let Some(key) = cfg.api_key.as_ref().filter(|v| !v.trim().is_empty()) {
+        req = req.header("x-api-key", key);
+    }
+    req = req.header("anthropic-version", "2023-06-01");
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("ai error {status}: {text}"));
+    }
+    let data: AnthropicResponse = resp.json().await?;
+    let content = data
+        .content
+        .first()
+        .map(|c| c.text.clone())
+        .ok_or_else(|| anyhow::anyhow!("ai empty response"))?;
+    Ok(content)
+}
+
+async fn request_anthropic_stream(
+    client: reqwest::Client,
+    cfg: &AiConfig,
+    messages: Vec<ChatMessage>,
+    tx: mpsc::Sender<AssistantEvent>,
+) -> Result<String> {
+    let url = format!("{}/v1/messages", cfg.endpoint.trim_end_matches('/'));
+    let (system, messages) = split_system_prompt(messages);
+    let body = AnthropicRequest {
+        model: cfg.model.clone(),
+        max_tokens: cfg.max_tokens,
+        temperature: cfg.temperature,
+        messages,
+        system,
+        stream: true,
+    };
+    let mut req = client.post(url).json(&body);
+    if let Some(key) = cfg.api_key.as_ref().filter(|v| !v.trim().is_empty()) {
+        req = req.header("x-api-key", key);
+    }
+    req = req.header("anthropic-version", "2023-06-01");
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("ai error {status}: {text}"));
+    }
+    let mut out = String::new();
+    let stream = resp.bytes_stream().map_err(io::Error::other);
+    let reader = tokio_util::io::StreamReader::new(stream);
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with("data:") {
+            continue;
+        }
+        let data = line.trim_start_matches("data:").trim();
+        if data == "[DONE]" {
+            break;
+        }
+        let chunk: AnthropicStreamChunk = serde_json::from_str(data)?;
+        if let Some(err) = chunk.error {
+            return Err(anyhow::anyhow!("anthropic error: {}", err.message));
+        }
+        let text = match chunk.kind.as_str() {
+            "content_block_delta" => chunk.delta.and_then(|d| d.text),
+            "content_block_start" => chunk.content_block.and_then(|c| c.text),
+            _ => None,
+        };
+        if let Some(text) = text {
+            if !text.is_empty() {
+                out.push_str(&text);
+                let _ = tx.send(AssistantEvent::Delta(text)).await;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn split_system_prompt(messages: Vec<ChatMessage>) -> (Option<String>, Vec<ChatMessage>) {
+    let mut system = String::new();
+    let mut out = Vec::new();
+    for message in messages {
+        if message.role == "system" {
+            if !system.is_empty() {
+                system.push('\n');
+            }
+            system.push_str(&message.content);
+        } else {
+            out.push(message);
+        }
+    }
+    let system = if system.trim().is_empty() {
+        None
+    } else {
+        Some(system)
+    };
+    (system, out)
+}
+
+fn extract_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
+    let mut calls = Vec::new();
+    let mut cleaned = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("@tool") {
+            let json = rest.trim();
+            if json.starts_with('{') {
+                if let Ok(call) = serde_json::from_str::<ToolCall>(json) {
+                    calls.push(call);
+                    continue;
+                }
+            }
+        }
+        cleaned.push(line);
+    }
+    let cleaned = cleaned.join("\n").trim().to_string();
+    (cleaned, calls)
+}
+
+struct ToolContext {
+    sessions: Arc<SessionManager>,
+    queue: TransferQueue,
+    config: AppConfig,
+    local_base: String,
+    remote_base: String,
+    session_id: Option<Uuid>,
+    connections: Vec<Connection>,
+}
+
+const TOOL_OUTPUT_LIMIT: usize = 8000;
+const TOOL_DEFAULT_TIMEOUT_MS: u64 = 20000;
+const TOOL_DEFAULT_SEARCH_LIMIT: usize = 50;
+const TOOL_DEFAULT_MAX_BYTES: usize = 1_000_000;
+
+async fn execute_tool_call(call: ToolCall, ctx: ToolContext) -> ToolResult {
+    let result = match call.name.as_str() {
+        "local.exec" => tool_local_exec(&call, &ctx).await,
+        "remote.exec" => tool_remote_exec(&call, &ctx).await,
+        "local.list" => tool_local_list(&call, &ctx).await,
+        "remote.list" => tool_remote_list(&call, &ctx).await,
+        "local.read" => tool_local_read(&call, &ctx).await,
+        "remote.read" => tool_remote_read(&call, &ctx).await,
+        "local.write" => tool_local_write(&call, &ctx).await,
+        "remote.write" => tool_remote_write(&call, &ctx).await,
+        "local.search" => tool_local_search(&call, &ctx).await,
+        "remote.search" => tool_remote_search(&call, &ctx).await,
+        "local.mkdir" => tool_local_mkdir(&call, &ctx).await,
+        "remote.mkdir" => tool_remote_mkdir(&call, &ctx).await,
+        "local.remove" => tool_local_remove(&call, &ctx).await,
+        "remote.remove" => tool_remote_remove(&call, &ctx).await,
+        "local.rename" => tool_local_rename(&call, &ctx).await,
+        "remote.rename" => tool_remote_rename(&call, &ctx).await,
+        "transfer.copy" => tool_transfer_copy(&call, &ctx).await,
+        "connections.list" => tool_connections_list(&call, &ctx).await,
+        _ => Err(anyhow::anyhow!("unknown tool: {}", call.name)),
+    };
+    match result {
+        Ok(output) => ToolResult {
+            call,
+            success: true,
+            output,
+        },
+        Err(err) => ToolResult {
+            call,
+            success: false,
+            output: err.to_string(),
+        },
+    }
+}
+
+fn tool_arg_string(args: &serde_json::Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn tool_required_string(args: &serde_json::Value, key: &str) -> Result<String> {
+    tool_arg_string(args, key).ok_or_else(|| anyhow::anyhow!("{key} is required"))
+}
+
+fn tool_arg_bool(args: &serde_json::Value, key: &str) -> Option<bool> {
+    match args.get(key) {
+        Some(serde_json::Value::Bool(v)) => Some(*v),
+        Some(serde_json::Value::String(v)) => v.parse().ok(),
+        _ => None,
+    }
+}
+
+fn tool_arg_u64(args: &serde_json::Value, key: &str) -> Option<u64> {
+    match args.get(key) {
+        Some(serde_json::Value::Number(v)) => v.as_u64(),
+        Some(serde_json::Value::String(v)) => v.parse().ok(),
+        _ => None,
+    }
+}
+
+fn tool_arg_usize(args: &serde_json::Value, key: &str) -> Option<usize> {
+    tool_arg_u64(args, key).map(|v| v as usize)
+}
+
+fn resolve_local_path(value: Option<String>, base: &str) -> PathBuf {
+    let input = value.unwrap_or_else(|| base.to_string());
+    let path = PathBuf::from(&input);
+    if path.is_absolute() {
+        path
+    } else {
+        let mut base = PathBuf::from(base);
+        base.push(path);
+        base
+    }
+}
+
+fn resolve_remote_path(value: Option<String>, base: &str) -> String {
+    let input = value.unwrap_or_else(|| base.to_string());
+    if input.starts_with('/') {
+        input
+    } else if base.ends_with('/') {
+        format!("{base}{input}")
+    } else {
+        format!("{base}/{input}")
+    }
+}
+
+fn remote_parent(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        return None;
+    }
+    if let Some(idx) = trimmed.rfind('/') {
+        if idx == 0 {
+            return Some("/".to_string());
+        }
+        return Some(trimmed[..idx].to_string());
+    }
+    None
+}
+
+fn trim_output(value: &str) -> String {
+    if value.chars().count() <= TOOL_OUTPUT_LIMIT {
+        return value.to_string();
+    }
+    let trimmed: String = value
+        .chars()
+        .take(TOOL_OUTPUT_LIMIT.saturating_sub(3))
+        .collect();
+    format!("{trimmed}...")
+}
+
+#[derive(Serialize)]
+struct ToolExecOutput {
+    status: i32,
+    output: String,
+}
+
+async fn tool_local_exec(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let command = tool_required_string(&call.args, "command")?;
+    let timeout_ms = tool_arg_u64(&call.args, "timeout_ms").unwrap_or(TOOL_DEFAULT_TIMEOUT_MS);
+    let mut cmd = if cfg!(windows) {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(&command);
+        cmd
+    } else {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-lc").arg(&command);
+        cmd
+    };
+    cmd.current_dir(&ctx.local_base);
+    let output = if timeout_ms > 0 {
+        timeout(Duration::from_millis(timeout_ms), cmd.output()).await??
+    } else {
+        cmd.output().await?
+    };
+    let mut combined = String::new();
+    combined.push_str(&String::from_utf8_lossy(&output.stdout));
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    let status = output.status.code().unwrap_or(-1);
+    let result = ToolExecOutput {
+        status,
+        output: trim_output(&combined),
+    };
+    Ok(serde_json::to_string_pretty(&result)?)
+}
+
+async fn tool_remote_exec(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let command = tool_required_string(&call.args, "command")?;
+    let timeout_ms = tool_arg_u64(&call.args, "timeout_ms").unwrap_or(TOOL_DEFAULT_TIMEOUT_MS);
+    let session_id = ctx
+        .session_id
+        .ok_or_else(|| anyhow::anyhow!("no active session"))?;
+    let handle = ctx
+        .sessions
+        .get_session(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    let exec_fut = handle.session.exec(&command);
+    let (status, output) = if timeout_ms > 0 {
+        timeout(Duration::from_millis(timeout_ms), exec_fut).await??
+    } else {
+        exec_fut.await?
+    };
+    let text = String::from_utf8_lossy(&output).to_string();
+    let result = ToolExecOutput {
+        status,
+        output: trim_output(&text),
+    };
+    Ok(serde_json::to_string_pretty(&result)?)
+}
+
+#[derive(Serialize)]
+struct ToolListEntry {
+    name: String,
+    is_dir: bool,
+    size: u64,
+}
+
+#[derive(Serialize)]
+struct ToolListOutput {
+    path: String,
+    entries: Vec<ToolListEntry>,
+}
+
+async fn tool_local_list(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let path = resolve_local_path(tool_arg_string(&call.args, "path"), &ctx.local_base);
+    let include_hidden =
+        tool_arg_bool(&call.args, "include_hidden").unwrap_or(ctx.config.ui.show_hidden_files);
+    let limit = tool_arg_usize(&call.args, "limit").unwrap_or(TOOL_DEFAULT_SEARCH_LIMIT);
+    let entries = list_local(&path.to_string_lossy()).await?;
+    let mut out = Vec::new();
+    for entry in entries {
+        if !include_hidden && entry.name.starts_with('.') {
+            continue;
+        }
+        out.push(ToolListEntry {
+            name: entry.name,
+            is_dir: entry.is_dir,
+            size: entry.size,
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    let result = ToolListOutput {
+        path: path.to_string_lossy().to_string(),
+        entries: out,
+    };
+    Ok(serde_json::to_string_pretty(&result)?)
+}
+
+async fn tool_remote_list(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let path = resolve_remote_path(tool_arg_string(&call.args, "path"), &ctx.remote_base);
+    let include_hidden =
+        tool_arg_bool(&call.args, "include_hidden").unwrap_or(ctx.config.ui.show_hidden_files);
+    let limit = tool_arg_usize(&call.args, "limit").unwrap_or(TOOL_DEFAULT_SEARCH_LIMIT);
+    let session_id = ctx
+        .session_id
+        .ok_or_else(|| anyhow::anyhow!("no active session"))?;
+    let handle = ctx
+        .sessions
+        .get_session(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    let sftp = handle.session.open_sftp().await?;
+    let entries = list_remote(&sftp, &path).await?;
+    let mut out = Vec::new();
+    for entry in entries {
+        if !include_hidden && entry.name.starts_with('.') {
+            continue;
+        }
+        out.push(ToolListEntry {
+            name: entry.name,
+            is_dir: entry.is_dir,
+            size: entry.size,
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    let result = ToolListOutput { path, entries: out };
+    Ok(serde_json::to_string_pretty(&result)?)
+}
+
+#[derive(Serialize)]
+struct ToolReadOutput {
+    path: String,
+    content: String,
+}
+
+async fn tool_local_read(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let path = resolve_local_path(
+        Some(tool_required_string(&call.args, "path")?),
+        &ctx.local_base,
+    );
+    let max_bytes = tool_arg_usize(&call.args, "max_bytes").unwrap_or(TOOL_DEFAULT_MAX_BYTES);
+    let data = tokio::fs::read(&path).await?;
+    let mut text = String::from_utf8_lossy(&data).to_string();
+    if text.chars().count() > max_bytes {
+        text = text.chars().take(max_bytes).collect();
+    }
+    let result = ToolReadOutput {
+        path: path.to_string_lossy().to_string(),
+        content: trim_output(&text),
+    };
+    Ok(serde_json::to_string_pretty(&result)?)
+}
+
+async fn tool_remote_read(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let path = resolve_remote_path(
+        Some(tool_required_string(&call.args, "path")?),
+        &ctx.remote_base,
+    );
+    let max_bytes = tool_arg_usize(&call.args, "max_bytes").unwrap_or(TOOL_DEFAULT_MAX_BYTES);
+    let session_id = ctx
+        .session_id
+        .ok_or_else(|| anyhow::anyhow!("no active session"))?;
+    let handle = ctx
+        .sessions
+        .get_session(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    let sftp = handle.session.open_sftp().await?;
+    let mut file = sftp.open_read(&path).await?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).await?;
+    let mut text = String::from_utf8_lossy(&buf).to_string();
+    if text.chars().count() > max_bytes {
+        text = text.chars().take(max_bytes).collect();
+    }
+    let result = ToolReadOutput {
+        path,
+        content: trim_output(&text),
+    };
+    Ok(serde_json::to_string_pretty(&result)?)
+}
+
+#[derive(Serialize)]
+struct ToolWriteOutput {
+    path: String,
+    bytes: usize,
+}
+
+async fn tool_local_write(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let path = resolve_local_path(
+        Some(tool_required_string(&call.args, "path")?),
+        &ctx.local_base,
+    );
+    let content = tool_required_string(&call.args, "content")?;
+    let append = tool_arg_bool(&call.args, "append").unwrap_or(false);
+    let create_dirs = tool_arg_bool(&call.args, "create_dirs").unwrap_or(true);
+    if create_dirs {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(&path)
+        .await?;
+    file.write_all(content.as_bytes()).await?;
+    let result = ToolWriteOutput {
+        path: path.to_string_lossy().to_string(),
+        bytes: content.len(),
+    };
+    Ok(serde_json::to_string_pretty(&result)?)
+}
+
+async fn tool_remote_write(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let path = resolve_remote_path(
+        Some(tool_required_string(&call.args, "path")?),
+        &ctx.remote_base,
+    );
+    let content = tool_required_string(&call.args, "content")?;
+    let append = tool_arg_bool(&call.args, "append").unwrap_or(false);
+    let create_dirs = tool_arg_bool(&call.args, "create_dirs").unwrap_or(true);
+    let session_id = ctx
+        .session_id
+        .ok_or_else(|| anyhow::anyhow!("no active session"))?;
+    let handle = ctx
+        .sessions
+        .get_session(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    let sftp = handle.session.open_sftp().await?;
+    if create_dirs {
+        if let Some(parent) = remote_parent(&path) {
+            sftp.create_dir_all(&parent).await?;
+        }
+    }
+    if append {
+        let mut existing = Vec::new();
+        if let Ok(mut file) = sftp.open_read(&path).await {
+            let _ = file.read_to_end(&mut existing).await;
+        }
+        let mut file = sftp.open_write(&path, true).await?;
+        if !existing.is_empty() {
+            file.write_all(&existing).await?;
+        }
+        file.write_all(content.as_bytes()).await?;
+    } else {
+        let mut file = sftp.open_write(&path, true).await?;
+        file.write_all(content.as_bytes()).await?;
+    }
+    let result = ToolWriteOutput {
+        path,
+        bytes: content.len(),
+    };
+    Ok(serde_json::to_string_pretty(&result)?)
+}
+
+#[derive(Serialize)]
+struct ToolSearchOutput {
+    path: String,
+    query: String,
+    matches: Vec<String>,
+}
+
+async fn tool_local_search(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let base = resolve_local_path(tool_arg_string(&call.args, "path"), &ctx.local_base);
+    let query =
+        tool_arg_string(&call.args, "query").ok_or_else(|| anyhow::anyhow!("query is required"))?;
+    let limit = tool_arg_usize(&call.args, "limit").unwrap_or(TOOL_DEFAULT_SEARCH_LIMIT);
+    let max_bytes = tool_arg_usize(&call.args, "max_bytes").unwrap_or(TOOL_DEFAULT_MAX_BYTES);
+    let mut matches = Vec::new();
+    for entry in WalkDir::new(&base).into_iter().filter_map(Result::ok) {
+        if matches.len() >= limit {
+            break;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let meta = entry.metadata().ok();
+        if meta.map(|m| m.len() as usize > max_bytes).unwrap_or(false) {
+            continue;
+        }
+        let data = tokio::fs::read(entry.path()).await?;
+        if let Ok(text) = String::from_utf8(data) {
+            if text.contains(&query) {
+                matches.push(entry.path().to_string_lossy().to_string());
+            }
+        }
+    }
+    let result = ToolSearchOutput {
+        path: base.to_string_lossy().to_string(),
+        query,
+        matches,
+    };
+    Ok(serde_json::to_string_pretty(&result)?)
+}
+
+async fn tool_remote_search(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let base = resolve_remote_path(tool_arg_string(&call.args, "path"), &ctx.remote_base);
+    let query =
+        tool_arg_string(&call.args, "query").ok_or_else(|| anyhow::anyhow!("query is required"))?;
+    let limit = tool_arg_usize(&call.args, "limit").unwrap_or(TOOL_DEFAULT_SEARCH_LIMIT);
+    let max_bytes = tool_arg_usize(&call.args, "max_bytes").unwrap_or(TOOL_DEFAULT_MAX_BYTES);
+    let session_id = ctx
+        .session_id
+        .ok_or_else(|| anyhow::anyhow!("no active session"))?;
+    let handle = ctx
+        .sessions
+        .get_session(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    let sftp = handle.session.open_sftp().await?;
+    let mut stack = vec![base.clone()];
+    let mut matches = Vec::new();
+    while let Some(path) = stack.pop() {
+        if matches.len() >= limit {
+            break;
+        }
+        let entries = sftp.read_dir(&path).await?;
+        for entry in entries {
+            if matches.len() >= limit {
+                break;
+            }
+            if entry.is_dir {
+                stack.push(entry.path);
+            } else {
+                if entry.size > max_bytes as u64 {
+                    continue;
+                }
+                let mut file = sftp.open_read(&entry.path).await?;
+                let mut buf = Vec::new();
+                file.read_to_end(&mut buf).await?;
+                if let Ok(text) = String::from_utf8(buf) {
+                    if text.contains(&query) {
+                        matches.push(entry.path.clone());
+                    }
+                }
+            }
+        }
+    }
+    let result = ToolSearchOutput {
+        path: base,
+        query,
+        matches,
+    };
+    Ok(serde_json::to_string_pretty(&result)?)
+}
+
+async fn tool_local_mkdir(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let path = resolve_local_path(
+        Some(tool_required_string(&call.args, "path")?),
+        &ctx.local_base,
+    );
+    tokio::fs::create_dir_all(&path).await?;
+    Ok(serde_json::to_string_pretty(&ToolWriteOutput {
+        path: path.to_string_lossy().to_string(),
+        bytes: 0,
+    })?)
+}
+
+async fn tool_remote_mkdir(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let path = resolve_remote_path(
+        Some(tool_required_string(&call.args, "path")?),
+        &ctx.remote_base,
+    );
+    let session_id = ctx
+        .session_id
+        .ok_or_else(|| anyhow::anyhow!("no active session"))?;
+    let handle = ctx
+        .sessions
+        .get_session(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    let sftp = handle.session.open_sftp().await?;
+    sftp.create_dir_all(&path).await?;
+    Ok(serde_json::to_string_pretty(&ToolWriteOutput {
+        path,
+        bytes: 0,
+    })?)
+}
+
+async fn tool_local_remove(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let path = resolve_local_path(
+        Some(tool_required_string(&call.args, "path")?),
+        &ctx.local_base,
+    );
+    let recursive = tool_arg_bool(&call.args, "recursive").unwrap_or(false);
+    if recursive {
+        let meta = tokio::fs::metadata(&path).await?;
+        if meta.is_dir() {
+            tokio::fs::remove_dir_all(&path).await?;
+        } else {
+            tokio::fs::remove_file(&path).await?;
+        }
+    } else {
+        let meta = tokio::fs::metadata(&path).await?;
+        if meta.is_dir() {
+            tokio::fs::remove_dir(&path).await?;
+        } else {
+            tokio::fs::remove_file(&path).await?;
+        }
+    }
+    Ok(serde_json::to_string_pretty(&ToolWriteOutput {
+        path: path.to_string_lossy().to_string(),
+        bytes: 0,
+    })?)
+}
+
+async fn tool_remote_remove(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let path = resolve_remote_path(
+        Some(tool_required_string(&call.args, "path")?),
+        &ctx.remote_base,
+    );
+    let recursive = tool_arg_bool(&call.args, "recursive").unwrap_or(false);
+    let session_id = ctx
+        .session_id
+        .ok_or_else(|| anyhow::anyhow!("no active session"))?;
+    let handle = ctx
+        .sessions
+        .get_session(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    let sftp = handle.session.open_sftp().await?;
+    if recursive {
+        let meta = sftp.metadata(&path).await?;
+        if !meta.file_type().is_dir() {
+            sftp.remove_file(&path).await?;
+            return Ok(serde_json::to_string_pretty(&ToolWriteOutput {
+                path,
+                bytes: 0,
+            })?);
+        }
+        let mut stack = vec![(path.clone(), false)];
+        while let Some((current, visited)) = stack.pop() {
+            if visited {
+                let _ = sftp.remove_dir(&current).await;
+                continue;
+            }
+            stack.push((current.clone(), true));
+            for entry in sftp.read_dir(&current).await? {
+                if entry.is_dir {
+                    stack.push((entry.path, false));
+                } else {
+                    let _ = sftp.remove_file(&entry.path).await;
+                }
+            }
+        }
+    } else {
+        let meta = sftp.metadata(&path).await?;
+        if meta.file_type().is_dir() {
+            sftp.remove_dir(&path).await?;
+        } else {
+            sftp.remove_file(&path).await?;
+        }
+    }
+    Ok(serde_json::to_string_pretty(&ToolWriteOutput {
+        path,
+        bytes: 0,
+    })?)
+}
+
+async fn tool_local_rename(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let from = resolve_local_path(
+        Some(tool_required_string(&call.args, "from")?),
+        &ctx.local_base,
+    );
+    let to = resolve_local_path(
+        Some(tool_required_string(&call.args, "to")?),
+        &ctx.local_base,
+    );
+    tokio::fs::rename(&from, &to).await?;
+    Ok(serde_json::to_string_pretty(&ToolWriteOutput {
+        path: to.to_string_lossy().to_string(),
+        bytes: 0,
+    })?)
+}
+
+async fn tool_remote_rename(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let from = resolve_remote_path(
+        Some(tool_required_string(&call.args, "from")?),
+        &ctx.remote_base,
+    );
+    let to = resolve_remote_path(
+        Some(tool_required_string(&call.args, "to")?),
+        &ctx.remote_base,
+    );
+    let session_id = ctx
+        .session_id
+        .ok_or_else(|| anyhow::anyhow!("no active session"))?;
+    let handle = ctx
+        .sessions
+        .get_session(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    let sftp = handle.session.open_sftp().await?;
+    sftp.rename(&from, &to).await?;
+    Ok(serde_json::to_string_pretty(&ToolWriteOutput {
+        path: to,
+        bytes: 0,
+    })?)
+}
+
+#[derive(Serialize)]
+struct ToolTransferOutput {
+    job_id: String,
+}
+
+async fn tool_transfer_copy(call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let source_raw = tool_required_string(&call.args, "source")?;
+    let dest_raw = tool_required_string(&call.args, "dest")?;
+    let session_id = ctx.session_id;
+    let (source_ep, source_path) =
+        parse_transfer_endpoint(&source_raw, &ctx.local_base, &ctx.remote_base, session_id)?;
+    let (dest_ep, dest_path) =
+        parse_transfer_endpoint(&dest_raw, &ctx.local_base, &ctx.remote_base, session_id)?;
+    let (is_dir, size) = resolve_transfer_meta(&source_ep, &source_path, ctx).await?;
+    let file = TransferFile {
+        source_path: source_path.clone(),
+        dest_path: dest_path.clone(),
+        size,
+        is_dir,
+    };
+    let job = TransferJob {
+        id: Uuid::new_v4(),
+        source: source_ep,
+        dest: dest_ep,
+        files: vec![file],
+        options: TransferOptions {
+            overwrite: catsolle_core::transfer::OverwriteMode::Replace,
+            preserve_permissions: true,
+            preserve_times: true,
+            verify_checksum: ctx.config.transfer.verify_checksum,
+            resume: ctx.config.transfer.resume,
+            buffer_size: ctx.config.transfer.buffer_size,
+        },
+        state: TransferState::Queued,
+        progress: Default::default(),
+        created_at: chrono::Utc::now(),
+    };
+    let job_id = job.id;
+    ctx.queue
+        .enqueue(job)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    Ok(serde_json::to_string_pretty(&ToolTransferOutput {
+        job_id: job_id.to_string(),
+    })?)
+}
+
+async fn resolve_transfer_meta(
+    source: &TransferEndpoint,
+    path: &str,
+    ctx: &ToolContext,
+) -> Result<(bool, u64)> {
+    match source {
+        TransferEndpoint::Local { .. } => {
+            let meta = tokio::fs::metadata(path).await?;
+            Ok((meta.is_dir(), meta.len()))
+        }
+        TransferEndpoint::Remote { session_id, .. } => {
+            let handle = ctx
+                .sessions
+                .get_session(*session_id)
+                .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+            let sftp = handle.session.open_sftp().await?;
+            let meta = sftp.metadata(path).await?;
+            let is_dir = meta.file_type().is_dir();
+            let size = meta.size.unwrap_or(0);
+            Ok((is_dir, size))
+        }
+    }
+}
+
+fn parse_transfer_endpoint(
+    raw: &str,
+    local_base: &str,
+    remote_base: &str,
+    session_id: Option<Uuid>,
+) -> Result<(TransferEndpoint, String)> {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix("remote:") {
+        let session_id = session_id.ok_or_else(|| anyhow::anyhow!("no active session"))?;
+        let path = resolve_remote_path(Some(rest.trim().to_string()), remote_base);
+        Ok((
+            TransferEndpoint::Remote {
+                session_id,
+                path: path.clone(),
+            },
+            path,
+        ))
+    } else {
+        let rest = raw.strip_prefix("local:").unwrap_or(raw);
+        let path = resolve_local_path(Some(rest.trim().to_string()), local_base)
+            .to_string_lossy()
+            .to_string();
+        Ok((
+            TransferEndpoint::Local {
+                path: PathBuf::from(&path),
+            },
+            path,
+        ))
+    }
+}
+
+#[derive(Serialize)]
+struct ToolConnectionsOutput {
+    connections: Vec<ToolConnectionInfo>,
+}
+
+#[derive(Serialize)]
+struct ToolConnectionInfo {
+    id: String,
+    name: String,
+    host: String,
+    port: u16,
+    username: String,
+}
+
+async fn tool_connections_list(_call: &ToolCall, ctx: &ToolContext) -> Result<String> {
+    let mut out = Vec::new();
+    for conn in &ctx.connections {
+        out.push(ToolConnectionInfo {
+            id: conn.id.to_string(),
+            name: conn.name.clone(),
+            host: conn.host.clone(),
+            port: conn.port,
+            username: conn.username.clone(),
+        });
+    }
+    Ok(serde_json::to_string_pretty(&ToolConnectionsOutput {
+        connections: out,
+    })?)
 }
 
 fn panel_visible_rows(area: Rect) -> usize {
@@ -2522,6 +4335,75 @@ fn format_duration(secs: u64) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+fn provider_list() -> [&'static str; 4] {
+    ["ollama", "openai", "openrouter", "anthropic"]
+}
+
+fn cycle_provider(current: &str, delta: i32) -> String {
+    let list = provider_list();
+    let pos = list
+        .iter()
+        .position(|p| p.eq_ignore_ascii_case(current))
+        .unwrap_or(0);
+    let len = list.len() as i32;
+    let mut next = pos as i32 + delta;
+    if next < 0 {
+        next = len - 1;
+    }
+    if next >= len {
+        next = 0;
+    }
+    list[next as usize].to_string()
+}
+
+fn provider_defaults(provider: &str) -> (String, String) {
+    match provider.trim().to_lowercase().as_str() {
+        "openai" => (
+            "https://api.openai.com".to_string(),
+            "gpt-4o-mini".to_string(),
+        ),
+        "openrouter" => (
+            "https://openrouter.ai/api".to_string(),
+            "anthropic/claude-opus-4-5".to_string(),
+        ),
+        "anthropic" => (
+            "https://api.anthropic.com".to_string(),
+            "opus-4.5".to_string(),
+        ),
+        _ => (
+            "http://localhost:11434".to_string(),
+            "qwen2.5:3b".to_string(),
+        ),
+    }
+}
+
+fn tool_definitions() -> Vec<String> {
+    vec![
+        "Tools:",
+        "- local.exec {command, timeout_ms?}",
+        "- remote.exec {command, timeout_ms?}",
+        "- local.list {path?, limit?, include_hidden?}",
+        "- remote.list {path?, limit?, include_hidden?}",
+        "- local.read {path, max_bytes?}",
+        "- remote.read {path, max_bytes?}",
+        "- local.write {path, content, append?, create_dirs?}",
+        "- remote.write {path, content, append?, create_dirs?}",
+        "- local.search {path?, query, limit?, max_bytes?}",
+        "- remote.search {path?, query, limit?, max_bytes?}",
+        "- local.mkdir {path}",
+        "- remote.mkdir {path}",
+        "- local.remove {path, recursive?}",
+        "- remote.remove {path, recursive?}",
+        "- local.rename {from, to}",
+        "- remote.rename {from, to}",
+        "- transfer.copy {source, dest}",
+        "- connections.list {}",
+    ]
+    .into_iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -2682,4 +4564,26 @@ fn should_prompt_password(err: &str) -> bool {
         || lower.contains("master password required")
         || lower.contains("ssh_auth_sock")
         || lower.contains("agent authentication failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_tool_calls() {
+        let input = "Hello\n@tool {\"name\":\"local.exec\",\"args\":{\"command\":\"ls\"}}\nDone";
+        let (cleaned, calls) = extract_tool_calls(input);
+        assert_eq!(cleaned, "Hello\nDone");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "local.exec");
+    }
+
+    #[test]
+    fn ignores_invalid_tool_calls() {
+        let input = "Hello\n@tool not-json\nDone";
+        let (cleaned, calls) = extract_tool_calls(input);
+        assert_eq!(cleaned, input);
+        assert!(calls.is_empty());
+    }
 }

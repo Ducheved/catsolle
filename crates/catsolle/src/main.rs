@@ -59,7 +59,16 @@ async fn main() -> Result<()> {
             connect_quick(&target).await?;
         }
         None => {
-            catsolle_tui::run(store, session_manager, transfer_queue, bus, config, i18n).await?;
+            catsolle_tui::run(
+                store,
+                session_manager,
+                transfer_queue,
+                bus,
+                config_manager,
+                config,
+                i18n,
+            )
+            .await?;
         }
     }
 

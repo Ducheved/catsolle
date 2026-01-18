@@ -165,6 +165,11 @@ pub struct AiConfig {
     pub history_max: usize,
     pub timeout_ms: u64,
     pub system_prompt: String,
+    pub streaming: bool,
+    pub agent_enabled: bool,
+    pub auto_mode: bool,
+    pub max_steps: u32,
+    pub tools_enabled: bool,
 }
 
 impl Default for AiConfig {
@@ -179,7 +184,12 @@ impl Default for AiConfig {
             max_tokens: 512,
             history_max: 40,
             timeout_ms: 20000,
-            system_prompt: "You are a helpful SSH and shell assistant. Answer in Russian. Suggest exact commands and explain risks briefly.".to_string(),
+            system_prompt: "You are an SSH and shell assistant. Answer in Russian. If you need an action, use only @tool {\"name\":\"...\",\"args\":{...}}. Tool results arrive as messages prefixed with \"Tool result\".".to_string(),
+            streaming: true,
+            agent_enabled: true,
+            auto_mode: false,
+            max_steps: 6,
+            tools_enabled: true,
         }
     }
 }
@@ -196,6 +206,11 @@ pub struct AiConfigLayer {
     pub history_max: Option<usize>,
     pub timeout_ms: Option<u64>,
     pub system_prompt: Option<String>,
+    pub streaming: Option<bool>,
+    pub agent_enabled: Option<bool>,
+    pub auto_mode: Option<bool>,
+    pub max_steps: Option<u32>,
+    pub tools_enabled: Option<bool>,
 }
 
 impl AiConfig {
@@ -229,6 +244,21 @@ impl AiConfig {
         }
         if let Some(v) = layer.system_prompt {
             self.system_prompt = v;
+        }
+        if let Some(v) = layer.streaming {
+            self.streaming = v;
+        }
+        if let Some(v) = layer.agent_enabled {
+            self.agent_enabled = v;
+        }
+        if let Some(v) = layer.auto_mode {
+            self.auto_mode = v;
+        }
+        if let Some(v) = layer.max_steps {
+            self.max_steps = v;
+        }
+        if let Some(v) = layer.tools_enabled {
+            self.tools_enabled = v;
         }
     }
 }
@@ -540,6 +570,15 @@ impl ConfigManager {
         }
         let cfg = AppConfig::default();
         let content = toml::to_string_pretty(&cfg).map_err(|e| anyhow::anyhow!(e))?;
+        fs::write(&self.paths.config_file, content)?;
+        Ok(())
+    }
+
+    pub fn save_config(&self, cfg: &AppConfig) -> Result<()> {
+        if let Some(parent) = self.paths.config_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = toml::to_string_pretty(cfg).map_err(|e| anyhow::anyhow!(e))?;
         fs::write(&self.paths.config_file, content)?;
         Ok(())
     }
