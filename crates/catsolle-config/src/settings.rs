@@ -184,7 +184,7 @@ impl Default for AiConfig {
             max_tokens: 512,
             history_max: 40,
             timeout_ms: 20000,
-            system_prompt: "You are an SSH and shell assistant. Answer in Russian. If you need an action, use only @tool {\"name\":\"...\",\"args\":{...}}. Tool results arrive as messages prefixed with \"Tool result\".".to_string(),
+            system_prompt: "Answer in Russian. Be concise.".to_string(),
             streaming: true,
             agent_enabled: true,
             auto_mode: false,

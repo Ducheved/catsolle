@@ -1172,13 +1172,14 @@ impl AppState {
         let theme = self.theme;
         let mut lines = Vec::new();
         for message in &self.assistant.messages {
-            let (label, label_style, text_style) = match message.role {
+            let (label, label_style, text_style, use_markdown) = match message.role {
                 AssistantRole::User => (
                     self.i18n.tr("ai-role-user"),
                     Style::default()
                         .fg(theme.accent_alt)
                         .add_modifier(Modifier::BOLD),
                     Style::default().fg(theme.text),
+                    false,
                 ),
                 AssistantRole::Assistant => (
                     self.i18n.tr("ai-role-assistant"),
@@ -1186,11 +1187,13 @@ impl AppState {
                         .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                     Style::default().fg(theme.text),
+                    true,
                 ),
                 AssistantRole::System => (
                     self.i18n.tr("ai-role-system"),
                     Style::default().fg(theme.muted),
                     Style::default().fg(theme.muted),
+                    false,
                 ),
                 AssistantRole::Error => (
                     self.i18n.tr("ai-role-error"),
@@ -1198,6 +1201,7 @@ impl AppState {
                         .fg(theme.error)
                         .add_modifier(Modifier::BOLD),
                     Style::default().fg(theme.error),
+                    false,
                 ),
                 AssistantRole::Tool => (
                     self.i18n.tr("ai-role-tool"),
@@ -1205,17 +1209,17 @@ impl AppState {
                         .fg(theme.accent_alt)
                         .add_modifier(Modifier::BOLD),
                     Style::default().fg(theme.muted),
+                    false,
                 ),
             };
-            let mut first = true;
-            for line in message.content.lines() {
-                if first {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{label}: "), label_style),
-                        Span::styled(line.to_string(), text_style),
-                    ]));
-                    first = false;
-                } else {
+
+            lines.push(Line::from(Span::styled(format!("{label}:"), label_style)));
+
+            if use_markdown {
+                let md_lines = render_markdown_lines(&message.content, theme, text_style);
+                lines.extend(md_lines);
+            } else {
+                for line in message.content.lines() {
                     lines.push(Line::from(Span::styled(line.to_string(), text_style)));
                 }
             }
@@ -2520,22 +2524,97 @@ impl AppState {
     }
 
     fn build_ai_system_prompt(&self) -> String {
-        let mut prompt = self.config.ai.system_prompt.trim().to_string();
+        let mut prompt = String::new();
+
+        prompt.push_str("You are an AI assistant integrated into catsolle - a TUI SSH client with dual-pane file manager.\n");
+        prompt.push_str("Your role: help the user with SSH connections, shell commands, file operations, and server administration.\n\n");
+
+        let custom = self.config.ai.system_prompt.trim();
+        if !custom.is_empty() {
+            prompt.push_str("User instructions: ");
+            prompt.push_str(custom);
+            prompt.push_str("\n\n");
+        }
+
+        prompt.push_str("=== Current Context ===\n");
+
         if let Some(conn) = &self.active_connection {
             prompt.push_str(&format!(
-                "\nTarget: {}@{}:{}",
+                "Connected to: {}@{}:{}\n",
                 conn.username, conn.host, conn.port
             ));
+            if !conn.name.is_empty() {
+                prompt.push_str(&format!("Connection name: {}\n", conn.name));
+            }
+        } else {
+            prompt.push_str("Status: Not connected to any server\n");
         }
-        prompt.push_str(&format!("\nLocal path: {}", self.left_panel.path));
-        prompt.push_str(&format!("\nRemote path: {}", self.right_panel.path));
-        if self.config.ai.tools_enabled {
-            for line in tool_definitions() {
-                prompt.push('\n');
-                prompt.push_str(&line);
+
+        let focus_str = match self.input_focus {
+            InputFocus::Terminal => "terminal",
+            InputFocus::Files => "file manager",
+            InputFocus::Assistant => "AI assistant",
+        };
+        prompt.push_str(&format!("Current focus: {focus_str}\n"));
+
+        prompt.push_str(&format!("Local directory: {}\n", self.left_panel.path));
+        if let Some(entry) = self.left_panel.entries.get(self.left_panel.selected) {
+            prompt.push_str(&format!("Selected local: {}\n", entry.name));
+        }
+
+        if self.shell.is_some() {
+            prompt.push_str(&format!("Remote directory: {}\n", self.right_panel.path));
+            if let Some(entry) = self.right_panel.entries.get(self.right_panel.selected) {
+                prompt.push_str(&format!("Selected remote: {}\n", entry.name));
             }
         }
+
+        let terminal_context = self.get_terminal_context(15);
+        if !terminal_context.is_empty() {
+            prompt.push_str("\n=== Recent Terminal Output ===\n");
+            prompt.push_str(&terminal_context);
+            prompt.push('\n');
+        }
+
+        if self.config.ai.tools_enabled {
+            prompt.push_str("\n=== Available Tools ===\n");
+            prompt.push_str("Use @tool {\"name\":\"...\",\"args\":{...}} to execute actions.\n");
+            for line in tool_definitions() {
+                prompt.push_str(&line);
+                prompt.push('\n');
+            }
+        }
+
+        prompt.push_str("\n=== Guidelines ===\n");
+        prompt.push_str("- Be concise but helpful\n");
+        prompt.push_str("- Suggest exact commands when relevant\n");
+        prompt.push_str("- Warn about destructive operations\n");
+        prompt.push_str("- Use tools only when the user asks to perform an action\n");
+
         prompt
+    }
+
+    fn get_terminal_context(&self, max_lines: usize) -> String {
+        let screen = self.terminal_parser.screen();
+        let (rows, cols) = screen.size();
+        let mut lines = Vec::new();
+
+        for row in 0..rows {
+            let mut line = String::new();
+            for col in 0..cols {
+                let cell = screen.cell(row, col);
+                if let Some(cell) = cell {
+                    line.push(cell.contents().chars().next().unwrap_or(' '));
+                }
+            }
+            let trimmed = line.trim_end();
+            if !trimmed.is_empty() {
+                lines.push(trimmed.to_string());
+            }
+        }
+
+        let start = lines.len().saturating_sub(max_lines);
+        lines[start..].join("\n")
     }
 
     fn handle_assistant_event(&mut self, event: AssistantEvent) {
@@ -4677,7 +4756,7 @@ fn parse_inline_markdown(text: &str, ctx: &MdRenderContext) -> Vec<Span<'static>
     let theme = ctx.theme;
     let base = ctx.base_style;
     let mut spans = Vec::new();
-    let mut chars: Vec<char> = text.chars().collect();
+    let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
     let mut current = String::new();
 
@@ -4694,10 +4773,7 @@ fn parse_inline_markdown(text: &str, ctx: &MdRenderContext) -> Vec<Span<'static>
             }
             if i < chars.len() {
                 let code: String = chars[start..i].iter().collect();
-                spans.push(Span::styled(
-                    code,
-                    Style::default().fg(theme.accent_alt),
-                ));
+                spans.push(Span::styled(code, Style::default().fg(theme.accent_alt)));
                 i += 1;
             }
             continue;
@@ -4715,10 +4791,7 @@ fn parse_inline_markdown(text: &str, ctx: &MdRenderContext) -> Vec<Span<'static>
             }
             if i + 1 < chars.len() {
                 let bold: String = chars[start..i].iter().collect();
-                spans.push(Span::styled(
-                    bold,
-                    base.add_modifier(Modifier::BOLD),
-                ));
+                spans.push(Span::styled(bold, base.add_modifier(Modifier::BOLD)));
                 i += 2;
             }
             continue;
@@ -4738,10 +4811,7 @@ fn parse_inline_markdown(text: &str, ctx: &MdRenderContext) -> Vec<Span<'static>
                 }
                 if i < chars.len() {
                     let italic: String = chars[start..i].iter().collect();
-                    spans.push(Span::styled(
-                        italic,
-                        base.add_modifier(Modifier::ITALIC),
-                    ));
+                    spans.push(Span::styled(italic, base.add_modifier(Modifier::ITALIC)));
                     i += 1;
                     continue;
                 }
