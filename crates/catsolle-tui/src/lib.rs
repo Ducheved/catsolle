@@ -4566,6 +4566,203 @@ fn should_prompt_password(err: &str) -> bool {
         || lower.contains("agent authentication failed")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MdBlockType {
+    Normal,
+    Code,
+}
+
+struct MdRenderContext {
+    block_type: MdBlockType,
+    theme: Theme,
+    base_style: Style,
+}
+
+fn render_markdown_lines(content: &str, theme: Theme, base_style: Style) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut ctx = MdRenderContext {
+        block_type: MdBlockType::Normal,
+        theme,
+        base_style,
+    };
+
+    for line in content.lines() {
+        if line.starts_with("```") {
+            ctx.block_type = match ctx.block_type {
+                MdBlockType::Normal => MdBlockType::Code,
+                MdBlockType::Code => MdBlockType::Normal,
+            };
+            let lang = line.trim_start_matches('`').trim();
+            if !lang.is_empty() && ctx.block_type == MdBlockType::Code {
+                lines.push(Line::from(Span::styled(
+                    format!("─── {lang} ───"),
+                    Style::default().fg(theme.muted),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "───────────",
+                    Style::default().fg(theme.muted),
+                )));
+            }
+            continue;
+        }
+
+        match ctx.block_type {
+            MdBlockType::Code => {
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(theme.accent_alt),
+                )));
+            }
+            MdBlockType::Normal => {
+                lines.push(render_markdown_line(line, &ctx));
+            }
+        }
+    }
+    lines
+}
+
+fn render_markdown_line(line: &str, ctx: &MdRenderContext) -> Line<'static> {
+    let theme = ctx.theme;
+
+    if let Some(rest) = line.strip_prefix("### ") {
+        return Line::from(Span::styled(
+            rest.to_string(),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(rest) = line.strip_prefix("## ") {
+        return Line::from(Span::styled(
+            rest.to_string(),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(rest) = line.strip_prefix("# ") {
+        return Line::from(Span::styled(
+            rest.to_string(),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ));
+    }
+
+    if line.starts_with("- ") || line.starts_with("* ") {
+        let rest = &line[2..];
+        let mut spans = vec![Span::styled("• ", Style::default().fg(theme.accent))];
+        spans.extend(parse_inline_markdown(rest, ctx));
+        return Line::from(spans);
+    }
+
+    if line.starts_with("| ") && line.ends_with(" |") {
+        return Line::from(Span::styled(
+            line.to_string(),
+            Style::default().fg(theme.muted),
+        ));
+    }
+    if line.chars().all(|c| c == '-' || c == '|' || c == ' ') && line.contains('-') {
+        return Line::from(Span::styled(
+            line.to_string(),
+            Style::default().fg(theme.muted),
+        ));
+    }
+
+    Line::from(parse_inline_markdown(line, ctx))
+}
+
+fn parse_inline_markdown(text: &str, ctx: &MdRenderContext) -> Vec<Span<'static>> {
+    let theme = ctx.theme;
+    let base = ctx.base_style;
+    let mut spans = Vec::new();
+    let mut chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let mut current = String::new();
+
+    while i < chars.len() {
+        if chars[i] == '`' {
+            if !current.is_empty() {
+                spans.push(Span::styled(current.clone(), base));
+                current.clear();
+            }
+            let start = i + 1;
+            i += 1;
+            while i < chars.len() && chars[i] != '`' {
+                i += 1;
+            }
+            if i < chars.len() {
+                let code: String = chars[start..i].iter().collect();
+                spans.push(Span::styled(
+                    code,
+                    Style::default().fg(theme.accent_alt),
+                ));
+                i += 1;
+            }
+            continue;
+        }
+
+        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            if !current.is_empty() {
+                spans.push(Span::styled(current.clone(), base));
+                current.clear();
+            }
+            let start = i + 2;
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '*') {
+                i += 1;
+            }
+            if i + 1 < chars.len() {
+                let bold: String = chars[start..i].iter().collect();
+                spans.push(Span::styled(
+                    bold,
+                    base.add_modifier(Modifier::BOLD),
+                ));
+                i += 2;
+            }
+            continue;
+        }
+
+        if chars[i] == '*' || chars[i] == '_' {
+            let marker = chars[i];
+            if i + 1 < chars.len() && chars[i + 1] != ' ' && chars[i + 1] != marker {
+                if !current.is_empty() {
+                    spans.push(Span::styled(current.clone(), base));
+                    current.clear();
+                }
+                let start = i + 1;
+                i += 1;
+                while i < chars.len() && chars[i] != marker {
+                    i += 1;
+                }
+                if i < chars.len() {
+                    let italic: String = chars[start..i].iter().collect();
+                    spans.push(Span::styled(
+                        italic,
+                        base.add_modifier(Modifier::ITALIC),
+                    ));
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        current.push(chars[i]);
+        i += 1;
+    }
+
+    if !current.is_empty() {
+        spans.push(Span::styled(current, base));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base));
+    }
+
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
