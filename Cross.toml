@@ -1,0 +1,11 @@
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update && apt-get install -y libssl-dev:arm64 || apt-get install -y libssl-dev"
+]
+
+[target.aarch64-unknown-linux-gnu.env]
+passthrough = [
+    "OPENSSL_DIR",
+    "OPENSSL_LIB_DIR",
+    "OPENSSL_INCLUDE_DIR",
+]
