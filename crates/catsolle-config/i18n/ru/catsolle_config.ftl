@@ -74,6 +74,7 @@ status-connection-create-error = Не удалось добавить подкл
 status-connection-error = Ошибка операции с подключением
 status-connection-updated = Подключение обновлено: { $name }
 status-connection-failed = Ошибка подключения: { $error }
+status-connection-connecting = Подключение к { $target }
 status-password-saved = Пароль сохранен
 status-agent-missing = SSH агент недоступен. Введите пароль.
 status-transfer = Копирование

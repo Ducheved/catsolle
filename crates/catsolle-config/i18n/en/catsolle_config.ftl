@@ -74,6 +74,7 @@ status-connection-create-error = Failed to add connection
 status-connection-error = Connection operation failed
 status-connection-updated = Connection updated: { $name }
 status-connection-failed = Connection failed: { $error }
+status-connection-connecting = Connecting to { $target }
 status-password-saved = Password saved
 status-agent-missing = SSH agent not available. Enter password.
 status-transfer = Copy

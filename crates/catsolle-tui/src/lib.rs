@@ -47,6 +47,11 @@ struct AppRunContext {
     i18n: I18n,
 }
 
+struct AppChannels {
+    assistant_tx: mpsc::Sender<AssistantEvent>,
+    connect_tx: mpsc::Sender<ConnectEvent>,
+}
+
 pub async fn run(
     store: ConnectionStore,
     sessions: Arc<SessionManager>,
@@ -86,6 +91,10 @@ async fn run_app(
     let mut event_stream = EventStream::new();
     let mut event_rx = ctx.bus.subscribe();
     let (assistant_tx, mut assistant_rx) = mpsc::channel::<AssistantEvent>(16);
+    let (connect_tx, mut connect_rx) = mpsc::channel::<ConnectEvent>(8);
+    let mut tick_interval =
+        tokio::time::interval(Duration::from_millis(CONNECT_ANIMATION_INTERVAL_MS));
+    tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut app = AppState::new(
         ctx.store,
         ctx.sessions,
@@ -93,7 +102,10 @@ async fn run_app(
         ctx.config_manager,
         ctx.config,
         ctx.i18n,
-        assistant_tx,
+        AppChannels {
+            assistant_tx,
+            connect_tx,
+        },
     )
     .await?;
 
@@ -109,10 +121,16 @@ async fn run_app(
             Either::Right(pending::<Option<Vec<u8>>>())
         };
         let shell_req_fut = shell_tool_rx.recv();
+        let connect_req_fut = connect_rx.recv();
         let deadline_fut = if let Some(deadline) = capture_deadline {
             Either::Left(tokio::time::sleep_until(deadline))
         } else {
             Either::Right(pending::<()>())
+        };
+        let tick_fut = if app.connecting.is_some() {
+            Either::Left(tick_interval.tick())
+        } else {
+            Either::Right(pending::<Instant>())
         };
 
         tokio::select! {
@@ -126,6 +144,8 @@ async fn run_app(
             maybe_output = output_fut => {
                 if let Some(data) = maybe_output {
                     app.process_shell_output(&data);
+                    app.auto_confirm_interactive().await?;
+                    app.try_start_pending_shell_tool().await;
                 }
             }
             maybe_bus = event_rx.recv() => {
@@ -147,8 +167,17 @@ async fn run_app(
                     app.handle_shell_tool_request(req).await;
                 }
             }
+            maybe_connect = connect_req_fut => {
+                if let Some(event) = maybe_connect {
+                    app.handle_connect_event(event).await?;
+                }
+            }
             _ = deadline_fut => {
                 app.finish_shell_capture(true);
+                app.try_start_pending_shell_tool().await;
+            }
+            _ = tick_fut => {
+                app.handle_tick();
             }
         }
     }
@@ -167,6 +196,7 @@ struct AppState {
     ai_client: reqwest::Client,
     assistant: AssistantState,
     assistant_tx: mpsc::Sender<AssistantEvent>,
+    connect_tx: mpsc::Sender<ConnectEvent>,
     connections: Vec<Connection>,
     selected: usize,
     mode: AppMode,
@@ -177,6 +207,7 @@ struct AppState {
     shell_tool_tx: mpsc::Sender<ShellToolRequest>,
     shell_tool_rx: mpsc::Receiver<ShellToolRequest>,
     shell_display_tail: Vec<u8>,
+    pending_shell_tools: VecDeque<ShellToolRequest>,
     left_panel: PanelState,
     right_panel: PanelState,
     active_panel_left: bool,
@@ -191,6 +222,8 @@ struct AppState {
     agent_steps_remaining: u32,
     overlay: Overlay,
     active_connection: Option<Connection>,
+    connecting: Option<ConnectingState>,
+    last_interactive_signature: Option<String>,
     terminal_size: Option<(u16, u16)>,
     pending_shell_resize: Option<(u16, u16)>,
 }
@@ -416,6 +449,12 @@ enum AssistantEvent {
     ToolResult(ToolResult),
 }
 
+#[derive(Clone, Debug)]
+enum ConnectEvent {
+    Success { session_id: Uuid, conn: Connection },
+    Failure { conn: Connection, error: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AssistantCommand {
     Ai(bool),
@@ -435,6 +474,11 @@ enum AssistantCommandError {
     Unknown,
     MissingValue,
     InvalidValue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InteractiveAction {
+    Enter,
 }
 
 struct ShellToolRequest {
@@ -457,6 +501,11 @@ struct ShellToolResponse {
     timed_out: bool,
     screen: String,
     status: Option<i32>,
+}
+
+struct ConnectingState {
+    conn: Connection,
+    frame: usize,
 }
 
 struct ShellCapture {
@@ -499,7 +548,7 @@ impl AppState {
         config_manager: ConfigManager,
         config: AppConfig,
         i18n: I18n,
-        assistant_tx: mpsc::Sender<AssistantEvent>,
+        channels: AppChannels,
     ) -> Result<Self> {
         let connections = store.list_connections().unwrap_or_default();
         let mut parser = Parser::new(24, 80, 0);
@@ -521,7 +570,8 @@ impl AppState {
             theme: Theme::kawaii(),
             ai_client,
             assistant,
-            assistant_tx,
+            assistant_tx: channels.assistant_tx,
+            connect_tx: channels.connect_tx,
             connections,
             selected: 0,
             mode: AppMode::Connections,
@@ -532,6 +582,7 @@ impl AppState {
             shell_tool_tx,
             shell_tool_rx,
             shell_display_tail: Vec::new(),
+            pending_shell_tools: VecDeque::new(),
             left_panel: PanelState::local_default(),
             right_panel: PanelState::remote_default(),
             active_panel_left: true,
@@ -546,6 +597,8 @@ impl AppState {
             agent_steps_remaining: 0,
             overlay: Overlay::None,
             active_connection: None,
+            connecting: None,
+            last_interactive_signature: None,
             terminal_size: None,
             pending_shell_resize: None,
         };
@@ -1251,6 +1304,9 @@ impl AppState {
 
     fn header_status_line(&self) -> Option<String> {
         let mut parts = Vec::new();
+        if let Some(connecting) = self.connecting_status_line() {
+            parts.push(connecting);
+        }
         if let Some(status) = &self.status_message {
             parts.push(status.clone());
         }
@@ -1266,6 +1322,15 @@ impl AppState {
         } else {
             Some(parts.join(" | "))
         }
+    }
+
+    fn connecting_status_line(&self) -> Option<String> {
+        let connecting = self.connecting.as_ref()?;
+        let mut args = FluentArgs::new();
+        args.set("target", connection_target(&connecting.conn));
+        let base = self.i18n.tr_args("status-connection-connecting", &args);
+        let spinner = CONNECT_SPINNER_FRAMES[connecting.frame % CONNECT_SPINNER_FRAMES.len()];
+        Some(format!("{base} {spinner}"))
     }
 
     fn assistant_lines(&self) -> Vec<Line<'static>> {
@@ -1399,6 +1464,66 @@ impl AppState {
         self.finish_shell_capture(false);
     }
 
+    async fn start_shell_tool_request(&mut self, req: ShellToolRequest) {
+        let Some(shell) = self.shell.as_mut() else {
+            warn!("shell tool no active shell");
+            let _ = req.tx.send(Err("no active shell".to_string()));
+            return;
+        };
+        let mut input = req.input;
+        if req.append_newline && !input.ends_with('\n') && !input.ends_with('\r') {
+            input.push('\n');
+        }
+        let wait_ms = req.wait_ms.min(SHELL_MAX_WAIT_MS);
+        let timeout_ms = if req.timeout_ms == 0 {
+            SHELL_MAX_TIMEOUT_MS.max(wait_ms)
+        } else {
+            req.timeout_ms.min(SHELL_MAX_TIMEOUT_MS).max(wait_ms)
+        };
+        let max_bytes = req.max_bytes.clamp(1, SHELL_LOG_MAX_BYTES);
+        let start_offset = self.shell_log.end_offset();
+        if let Err(err) = shell.write(input.as_bytes()).await {
+            warn!(error = %err, "shell tool write failed");
+            let _ = req.tx.send(Err(err.to_string()));
+            return;
+        }
+        let now = Instant::now();
+        let idle_deadline = now + Duration::from_millis(wait_ms);
+        let hard_deadline = now + Duration::from_millis(timeout_ms);
+        if req.marker.is_some() {
+            self.shell_display_tail.clear();
+        }
+        self.last_interactive_signature = None;
+        self.shell_capture = Some(ShellCapture {
+            start_offset,
+            max_bytes,
+            wait_ms,
+            idle_deadline,
+            hard_deadline,
+            marker: req.marker,
+            marker_end: None,
+            status: None,
+            marker_echo_seen: false,
+            tx: req.tx,
+        });
+        info!(
+            start_offset = start_offset,
+            wait_ms = wait_ms,
+            timeout_ms = timeout_ms,
+            "shell tool requested"
+        );
+    }
+
+    async fn try_start_pending_shell_tool(&mut self) {
+        if self.shell_capture.is_some() {
+            return;
+        }
+        let Some(req) = self.pending_shell_tools.pop_front() else {
+            return;
+        };
+        self.start_shell_tool_request(req).await;
+    }
+
     fn shell_capture_deadline(&self) -> Option<Instant> {
         self.shell_capture.as_ref().map(|capture| {
             if capture.marker.is_some() {
@@ -1476,56 +1601,15 @@ impl AppState {
 
     async fn handle_shell_tool_request(&mut self, req: ShellToolRequest) {
         if self.shell_capture.is_some() {
-            warn!("shell tool busy");
-            let _ = req.tx.send(Err("shell tool busy".to_string()));
+            if self.pending_shell_tools.len() >= SHELL_TOOL_QUEUE_MAX {
+                warn!("shell tool queue full");
+                let _ = req.tx.send(Err("shell tool queue full".to_string()));
+            } else {
+                self.pending_shell_tools.push_back(req);
+            }
             return;
         }
-        let Some(shell) = self.shell.as_mut() else {
-            warn!("shell tool no active shell");
-            let _ = req.tx.send(Err("no active shell".to_string()));
-            return;
-        };
-        let mut input = req.input;
-        if req.append_newline && !input.ends_with('\n') && !input.ends_with('\r') {
-            input.push('\n');
-        }
-        let wait_ms = req.wait_ms.min(SHELL_MAX_WAIT_MS);
-        let timeout_ms = if req.timeout_ms == 0 {
-            SHELL_MAX_TIMEOUT_MS.max(wait_ms)
-        } else {
-            req.timeout_ms.min(SHELL_MAX_TIMEOUT_MS).max(wait_ms)
-        };
-        let max_bytes = req.max_bytes.clamp(1, SHELL_LOG_MAX_BYTES);
-        let start_offset = self.shell_log.end_offset();
-        if let Err(err) = shell.write(input.as_bytes()).await {
-            warn!(error = %err, "shell tool write failed");
-            let _ = req.tx.send(Err(err.to_string()));
-            return;
-        }
-        let now = Instant::now();
-        let idle_deadline = now + Duration::from_millis(wait_ms);
-        let hard_deadline = now + Duration::from_millis(timeout_ms);
-        if req.marker.is_some() {
-            self.shell_display_tail.clear();
-        }
-        self.shell_capture = Some(ShellCapture {
-            start_offset,
-            max_bytes,
-            wait_ms,
-            idle_deadline,
-            hard_deadline,
-            marker: req.marker,
-            marker_end: None,
-            status: None,
-            marker_echo_seen: false,
-            tx: req.tx,
-        });
-        info!(
-            start_offset = start_offset,
-            wait_ms = wait_ms,
-            timeout_ms = timeout_ms,
-            "shell tool requested"
-        );
+        self.start_shell_tool_request(req).await;
     }
 
     fn finish_shell_capture(&mut self, force: bool) {
@@ -1542,6 +1626,7 @@ impl AppState {
             return;
         }
         let capture = self.shell_capture.take().unwrap();
+        self.last_interactive_signature = None;
         let timed_out = !marker_done && force && Instant::now() >= capture.hard_deadline;
         let response = self.build_shell_response(slice, timed_out, capture.status);
         let _ = capture.tx.send(Ok(response));
@@ -1846,6 +1931,67 @@ impl AppState {
         Ok(())
     }
 
+    fn handle_tick(&mut self) {
+        if let Some(connecting) = self.connecting.as_mut() {
+            let next = connecting.frame + 1;
+            connecting.frame = if next >= CONNECT_SPINNER_FRAMES.len() {
+                0
+            } else {
+                next
+            };
+        }
+    }
+
+    async fn auto_confirm_interactive(&mut self) -> Result<()> {
+        if !self.tool_busy || self.shell_capture.is_none() || !self.config.ai.tools_enabled {
+            return Ok(());
+        }
+        let Some((signature, action)) = self.detect_interactive_prompt() else {
+            return Ok(());
+        };
+        if self
+            .last_interactive_signature
+            .as_ref()
+            .map(|value| value == &signature)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        self.last_interactive_signature = Some(signature);
+        let Some(shell) = self.shell.as_mut() else {
+            return Ok(());
+        };
+        let bytes = match action {
+            InteractiveAction::Enter => b"\n".to_vec(),
+        };
+        shell.write(&bytes).await?;
+        Ok(())
+    }
+
+    fn detect_interactive_prompt(&self) -> Option<(String, InteractiveAction)> {
+        let screen = self.get_terminal_context(30);
+        detect_interactive_prompt_text(&screen).map(|action| (prompt_signature(&screen), action))
+    }
+
+    async fn handle_connect_event(&mut self, event: ConnectEvent) -> Result<()> {
+        self.connecting = None;
+        match event {
+            ConnectEvent::Success { session_id, conn } => {
+                self.enter_session(session_id, conn).await?;
+            }
+            ConnectEvent::Failure { conn, error } => {
+                if should_prompt_password(&error) {
+                    self.open_password_overlay(conn.id, PasswordMode::Connect);
+                } else {
+                    let mut args = FluentArgs::new();
+                    args.set("error", error);
+                    self.set_status(self.i18n.tr_args("status-connection-failed", &args));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn terminal_text(&self, area: Rect) -> Text<'static> {
         let screen = self.terminal_parser.screen();
         let (rows, cols) = screen.size();
@@ -1916,26 +2062,31 @@ impl AppState {
     }
 
     async fn start_connection(&mut self, conn: Connection) -> Result<()> {
+        if self.connecting.is_some() {
+            return Ok(());
+        }
         if matches!(conn.auth_method, AuthMethod::Agent) && !agent_available() {
             self.set_status(self.i18n.tr("status-agent-missing"));
             self.open_password_overlay(conn.id, PasswordMode::Connect);
             return Ok(());
         }
-        match self.sessions.connect(conn.clone(), None, None).await {
-            Ok(session_id) => {
-                self.enter_session(session_id, conn).await?;
-            }
-            Err(err) => {
-                let msg = err.to_string();
-                if should_prompt_password(&msg) {
-                    self.open_password_overlay(conn.id, PasswordMode::Connect);
-                } else {
-                    let mut args = FluentArgs::new();
-                    args.set("error", msg);
-                    self.set_status(self.i18n.tr_args("status-connection-failed", &args));
-                }
-            }
-        }
+        self.connecting = Some(ConnectingState {
+            conn: conn.clone(),
+            frame: 0,
+        });
+        let sessions = self.sessions.clone();
+        let tx = self.connect_tx.clone();
+        tokio::spawn(async move {
+            let result = sessions.connect(conn.clone(), None, None).await;
+            let event = match result {
+                Ok(session_id) => ConnectEvent::Success { session_id, conn },
+                Err(err) => ConnectEvent::Failure {
+                    conn,
+                    error: err.to_string(),
+                },
+            };
+            let _ = tx.send(event).await;
+        });
         Ok(())
     }
 
@@ -2024,18 +2175,33 @@ impl AppState {
         save: bool,
         master: Option<&str>,
     ) -> Result<(), String> {
+        if self.connecting.is_some() {
+            return Ok(());
+        }
         let conn = self
             .store
             .get_connection(id)
             .map_err(|_| self.i18n.tr("status-connection-error"))?;
-        let session_id = self
-            .sessions
-            .connect_with_password(conn.clone(), password, save, master)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.enter_session(session_id, conn)
-            .await
-            .map_err(|e| e.to_string())?;
+        self.connecting = Some(ConnectingState {
+            conn: conn.clone(),
+            frame: 0,
+        });
+        let sessions = self.sessions.clone();
+        let tx = self.connect_tx.clone();
+        let master_owned = master.map(|value| value.to_string());
+        tokio::spawn(async move {
+            let result = sessions
+                .connect_with_password(conn.clone(), password, save, master_owned.as_deref())
+                .await;
+            let event = match result {
+                Ok(session_id) => ConnectEvent::Success { session_id, conn },
+                Err(err) => ConnectEvent::Failure {
+                    conn,
+                    error: err.to_string(),
+                },
+            };
+            let _ = tx.send(event).await;
+        });
         Ok(())
     }
 
@@ -4292,6 +4458,9 @@ const SHELL_DEFAULT_MAX_BYTES: usize = 8192;
 const SHELL_RESPONSE_PAD_MS: u64 = 1000;
 const SHELL_SCREEN_LINES: usize = 20;
 const SHELL_MARKER_PREFIX: &str = "CATSOLLE_DONE";
+const CONNECT_ANIMATION_INTERVAL_MS: u64 = 120;
+const CONNECT_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+const SHELL_TOOL_QUEUE_MAX: usize = 8;
 
 async fn execute_tool_call(call: ToolCall, ctx: ToolContext) -> ToolResult {
     let result = match call.name.as_str() {
@@ -4396,6 +4565,56 @@ fn remote_parent(path: &str) -> Option<String> {
         return Some(trimmed[..idx].to_string());
     }
     None
+}
+
+fn prompt_signature(screen: &str) -> String {
+    let mut parts = Vec::new();
+    for line in screen.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        parts.push(trimmed);
+        if parts.len() >= 3 {
+            break;
+        }
+    }
+    let mut sig = parts.join(" | ");
+    if sig.is_empty() {
+        sig = screen.trim().to_string();
+    }
+    if sig.len() > 200 {
+        sig.truncate(200);
+    }
+    sig
+}
+
+fn detect_interactive_prompt_text(screen: &str) -> Option<InteractiveAction> {
+    let lower = screen.to_lowercase();
+    if lower.contains("package configuration")
+        && (lower.contains("<yes>") || lower.contains("[yes]"))
+        && (lower.contains("<no>") || lower.contains("[no]"))
+    {
+        return Some(InteractiveAction::Enter);
+    }
+    if lower.contains("do you want to continue?")
+        && (lower.contains("[y/n]") || lower.contains("(y/n)"))
+    {
+        return Some(InteractiveAction::Enter);
+    }
+    if lower.contains("[y/n]") || lower.contains("(y/n)") {
+        return Some(InteractiveAction::Enter);
+    }
+    None
+}
+
+fn connection_target(conn: &Connection) -> String {
+    let base = format!("{}@{}:{}", conn.username, conn.host, conn.port);
+    if conn.name.trim().is_empty() {
+        base
+    } else {
+        format!("{} ({base})", conn.name)
+    }
 }
 
 fn trim_output(value: &str) -> String {
@@ -6021,6 +6240,31 @@ fn parse_inline_markdown(text: &str, ctx: &MdRenderContext) -> Vec<Span<'static>
 mod tests {
     use super::*;
 
+    fn sample_connection(name: &str) -> Connection {
+        let now = chrono::Utc::now();
+        Connection {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "root".to_string(),
+            auth_method: AuthMethod::Agent,
+            jump_hosts: Vec::new(),
+            proxy: None,
+            startup_commands: Vec::new(),
+            env_vars: Vec::new(),
+            group_id: None,
+            tags: Vec::new(),
+            color: None,
+            icon: None,
+            notes: None,
+            created_at: now,
+            updated_at: now,
+            last_connected_at: None,
+            is_favorite: false,
+        }
+    }
+
     #[test]
     fn extracts_tool_calls() {
         let input = "Hello\n@tool {\"name\":\"local.exec\",\"args\":{\"command\":\"ls\"}}\nDone";
@@ -6187,5 +6431,42 @@ mod tests {
         let out = filter_shell_display_chunk(input.as_bytes(), token, &mut tail);
         assert_eq!(String::from_utf8(out).unwrap(), "beforeafter");
         assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn connection_target_without_name() {
+        let conn = sample_connection("");
+        assert_eq!(connection_target(&conn), "root@example.com:22");
+    }
+
+    #[test]
+    fn connection_target_with_name() {
+        let conn = sample_connection("prod");
+        assert_eq!(connection_target(&conn), "prod (root@example.com:22)");
+    }
+
+    #[test]
+    fn detects_debconf_prompt() {
+        let screen =
+            "Package configuration\nShould non-superusers be able to capture packets?\n<Yes> <No>";
+        assert_eq!(
+            detect_interactive_prompt_text(screen),
+            Some(InteractiveAction::Enter)
+        );
+    }
+
+    #[test]
+    fn detects_yes_no_prompt() {
+        let screen = "Do you want to continue? [Y/n]";
+        assert_eq!(
+            detect_interactive_prompt_text(screen),
+            Some(InteractiveAction::Enter)
+        );
+    }
+
+    #[test]
+    fn ignores_non_interactive_text() {
+        let screen = "Processing triggers for man-db...";
+        assert_eq!(detect_interactive_prompt_text(screen), None);
     }
 }
