@@ -1,0 +1,13 @@
+[package]
+name = "catsolle-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+
+catsolle-core = { path = "../catsolle-core" }
+catsolle-config = { path = "../catsolle-config" }

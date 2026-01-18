@@ -1,0 +1,22 @@
+[package]
+name = "catsolle"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+tokio = { workspace = true }
+ssh-key = { workspace = true }
+whoami = { workspace = true }
+
+catsolle-core = { path = "../catsolle-core" }
+catsolle-ssh = { path = "../catsolle-ssh" }
+catsolle-keychain = { path = "../catsolle-keychain" }
+catsolle-tui = { path = "../catsolle-tui" }
+catsolle-config = { path = "../catsolle-config" }
+catsolle-cli = { path = "../catsolle-cli" }

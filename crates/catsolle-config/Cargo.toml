@@ -1,0 +1,21 @@
+[package]
+name = "catsolle-config"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+directories = { workspace = true }
+regex = { workspace = true }
+
+rust-embed = { workspace = true }
+unic-langid = { workspace = true }
+i18n-embed = { workspace = true }
+i18n-embed-fl = { workspace = true }
+fluent-bundle = { workspace = true }
