@@ -54,6 +54,8 @@ jobs:
     needs: ci
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TARGET_DIR: target/${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
