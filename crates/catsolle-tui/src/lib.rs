@@ -176,6 +176,7 @@ struct AppState {
     shell_capture: Option<ShellCapture>,
     shell_tool_tx: mpsc::Sender<ShellToolRequest>,
     shell_tool_rx: mpsc::Receiver<ShellToolRequest>,
+    shell_display_tail: Vec<u8>,
     left_panel: PanelState,
     right_panel: PanelState,
     active_panel_left: bool,
@@ -467,6 +468,7 @@ struct ShellCapture {
     marker: Option<String>,
     marker_end: Option<u64>,
     status: Option<i32>,
+    marker_echo_seen: bool,
     tx: oneshot::Sender<Result<ShellToolResponse, String>>,
 }
 
@@ -529,6 +531,7 @@ impl AppState {
             shell_capture: None,
             shell_tool_tx,
             shell_tool_rx,
+            shell_display_tail: Vec::new(),
             left_panel: PanelState::local_default(),
             right_panel: PanelState::remote_default(),
             active_panel_left: true,
@@ -1368,7 +1371,24 @@ impl AppState {
     }
 
     fn process_shell_output(&mut self, data: &[u8]) {
-        self.terminal_parser.process(data);
+        let display_data = if let Some(marker) = self
+            .shell_capture
+            .as_ref()
+            .and_then(|capture| capture.marker.as_ref())
+        {
+            filter_shell_display_chunk(data, marker, &mut self.shell_display_tail)
+        } else if self.shell_display_tail.is_empty() {
+            data.to_vec()
+        } else {
+            let mut combined = Vec::with_capacity(self.shell_display_tail.len() + data.len());
+            combined.extend_from_slice(&self.shell_display_tail);
+            combined.extend_from_slice(data);
+            self.shell_display_tail.clear();
+            combined
+        };
+        if !display_data.is_empty() {
+            self.terminal_parser.process(&display_data);
+        }
         self.shell_log.append(data);
         if let Some(capture) = self.shell_capture.as_mut() {
             if capture.wait_ms > 0 {
@@ -1382,7 +1402,11 @@ impl AppState {
     fn shell_capture_deadline(&self) -> Option<Instant> {
         self.shell_capture.as_ref().map(|capture| {
             if capture.marker.is_some() {
-                capture.hard_deadline
+                if capture.marker_echo_seen && capture.idle_deadline < capture.hard_deadline {
+                    capture.idle_deadline
+                } else {
+                    capture.hard_deadline
+                }
             } else if capture.idle_deadline < capture.hard_deadline {
                 capture.idle_deadline
             } else {
@@ -1405,6 +1429,12 @@ impl AppState {
             None => return,
         };
         let Some((end_offset, status)) = self.find_shell_marker(start_offset, &marker) else {
+            let saw_echo = self.find_shell_marker_command(start_offset, &marker);
+            if let Some(capture) = self.shell_capture.as_mut() {
+                if !capture.marker_echo_seen && saw_echo {
+                    capture.marker_echo_seen = true;
+                }
+            }
             return;
         };
         if let Some(capture) = self.shell_capture.as_mut() {
@@ -1422,6 +1452,26 @@ impl AppState {
         let (_, end_idx, status) = find_shell_marker_in_bytes(&slice.bytes, marker)?;
         let end_offset = slice.start_offset + end_idx as u64;
         Some((end_offset, status))
+    }
+
+    fn find_shell_marker_command(&self, start_offset: u64, marker: &str) -> bool {
+        let available = self.shell_log.end_offset().saturating_sub(start_offset) as usize;
+        if available == 0 {
+            return false;
+        }
+        let slice = self.shell_log.read_from(start_offset, available);
+        let marker_cmd = shell_marker_command(marker);
+        let marker_cmd_sep = format!("; {marker_cmd}");
+        let marker_cmd_bytes = marker_cmd.as_bytes();
+        let marker_cmd_sep_bytes = marker_cmd_sep.as_bytes();
+        slice
+            .bytes
+            .windows(marker_cmd_bytes.len())
+            .any(|window| window == marker_cmd_bytes)
+            || slice
+                .bytes
+                .windows(marker_cmd_sep_bytes.len())
+                .any(|window| window == marker_cmd_sep_bytes)
     }
 
     async fn handle_shell_tool_request(&mut self, req: ShellToolRequest) {
@@ -1455,6 +1505,9 @@ impl AppState {
         let now = Instant::now();
         let idle_deadline = now + Duration::from_millis(wait_ms);
         let hard_deadline = now + Duration::from_millis(timeout_ms);
+        if req.marker.is_some() {
+            self.shell_display_tail.clear();
+        }
         self.shell_capture = Some(ShellCapture {
             start_offset,
             max_bytes,
@@ -1464,6 +1517,7 @@ impl AppState {
             marker: req.marker,
             marker_end: None,
             status: None,
+            marker_echo_seen: false,
             tx: req.tx,
         });
         info!(
@@ -1481,8 +1535,9 @@ impl AppState {
         let slice = self.shell_capture_slice(capture);
         let marker_active = capture.marker.is_some();
         let marker_done = capture.marker_end.is_some();
-        let should_finish =
-            marker_done || force || (!marker_active && slice.bytes.len() >= capture.max_bytes);
+        let should_finish = marker_done
+            || (!marker_active && (force || slice.bytes.len() >= capture.max_bytes))
+            || (marker_active && force && capture.marker_echo_seen);
         if !should_finish {
             return;
         }
@@ -4461,6 +4516,65 @@ fn shell_marker_command(token: &str) -> String {
     )
 }
 
+fn is_partial_prefix(slice: &[u8], pattern: &[u8]) -> bool {
+    if slice.len() >= pattern.len() {
+        return false;
+    }
+    slice == &pattern[..slice.len()]
+}
+
+fn filter_shell_display_chunk(data: &[u8], token: &str, tail: &mut Vec<u8>) -> Vec<u8> {
+    let marker_cmd = shell_marker_command(token);
+    let marker_cmd_bytes = marker_cmd.as_bytes();
+    let marker_cmd_sep = format!("; {marker_cmd}");
+    let marker_cmd_sep_bytes = marker_cmd_sep.as_bytes();
+    let marker_prefix = format!("\x1b]{};{};", SHELL_MARKER_PREFIX, token);
+    let marker_prefix_bytes = marker_prefix.as_bytes();
+    let mut buffer = Vec::with_capacity(tail.len() + data.len());
+    buffer.extend_from_slice(tail);
+    buffer.extend_from_slice(data);
+    let mut out = Vec::with_capacity(buffer.len());
+    let mut i = 0;
+    while i < buffer.len() {
+        if buffer[i..].starts_with(marker_cmd_sep_bytes) {
+            i += marker_cmd_sep_bytes.len();
+            continue;
+        }
+        if buffer[i..].starts_with(marker_cmd_bytes) {
+            i += marker_cmd_bytes.len();
+            continue;
+        }
+        if buffer[i..].starts_with(marker_prefix_bytes) {
+            let mut j = i + marker_prefix_bytes.len();
+            while j < buffer.len() && buffer[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < buffer.len() {
+                if buffer[j] == 0x07 {
+                    i = j + 1;
+                    continue;
+                }
+                if buffer[j] == 0x1b && j + 1 < buffer.len() && buffer[j + 1] == b'\\' {
+                    i = j + 2;
+                    continue;
+                }
+            }
+            break;
+        }
+        if is_partial_prefix(&buffer[i..], marker_cmd_sep_bytes)
+            || is_partial_prefix(&buffer[i..], marker_cmd_bytes)
+            || is_partial_prefix(&buffer[i..], marker_prefix_bytes)
+        {
+            break;
+        }
+        out.push(buffer[i]);
+        i += 1;
+    }
+    tail.clear();
+    tail.extend_from_slice(&buffer[i..]);
+    out
+}
+
 fn find_shell_marker_in_bytes(bytes: &[u8], token: &str) -> Option<(usize, usize, i32)> {
     let prefix = format!("\x1b]{};{};", SHELL_MARKER_PREFIX, token);
     let prefix_bytes = prefix.as_bytes();
@@ -6051,5 +6165,27 @@ mod tests {
     fn ignores_other_shell_marker() {
         let data = "\x1b]CATSOLLE_DONE;other;1\x07";
         assert!(find_shell_marker_in_bytes(data.as_bytes(), "token").is_none());
+    }
+
+    #[test]
+    fn filter_shell_display_removes_marker_command() {
+        let token = "abc";
+        let cmd = shell_marker_command(token);
+        let input = format!("root# {cmd}\n");
+        let mut tail = Vec::new();
+        let out = filter_shell_display_chunk(input.as_bytes(), token, &mut tail);
+        assert_eq!(String::from_utf8(out).unwrap(), "root# \n");
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn filter_shell_display_removes_marker_output() {
+        let token = "abc";
+        let marker = format!("\x1b]CATSOLLE_DONE;{};0\x07", token);
+        let input = format!("before{marker}after");
+        let mut tail = Vec::new();
+        let out = filter_shell_display_chunk(input.as_bytes(), token, &mut tail);
+        assert_eq!(String::from_utf8(out).unwrap(), "beforeafter");
+        assert!(tail.is_empty());
     }
 }
