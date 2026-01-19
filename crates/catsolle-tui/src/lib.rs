@@ -127,7 +127,7 @@ async fn run_app(
         } else {
             Either::Right(pending::<()>())
         };
-        let tick_fut = if app.connecting.is_some() {
+        let tick_fut = if app.connecting.is_some() || app.assistant.busy || app.tool_busy {
             Either::Left(tick_interval.tick())
         } else {
             Either::Right(pending::<Instant>())
@@ -224,6 +224,7 @@ struct AppState {
     active_connection: Option<Connection>,
     connecting: Option<ConnectingState>,
     last_interactive_signature: Option<String>,
+    ai_spinner_frame: usize,
     terminal_size: Option<(u16, u16)>,
     pending_shell_resize: Option<(u16, u16)>,
 }
@@ -599,6 +600,7 @@ impl AppState {
             active_connection: None,
             connecting: None,
             last_interactive_signature: None,
+            ai_spinner_frame: 0,
             terminal_size: None,
             pending_shell_resize: None,
         };
@@ -1718,7 +1720,8 @@ impl AppState {
             return self.i18n.tr("status-ai-off");
         }
         if self.assistant.busy || self.tool_busy {
-            return self.i18n.tr("status-ai-busy");
+            let label = self.i18n.tr("status-ai-busy");
+            return format!("{label} {}", ai_progress_bar(self.ai_spinner_frame));
         }
         let mut parts = vec![self.i18n.tr("status-ai-on")];
         if self.config.ai.tools_enabled {
@@ -1939,6 +1942,12 @@ impl AppState {
             } else {
                 next
             };
+        }
+        if self.assistant.busy || self.tool_busy {
+            let next = self.ai_spinner_frame + 1;
+            self.ai_spinner_frame = if next >= AI_PROGRESS_WIDTH { 0 } else { next };
+        } else {
+            self.ai_spinner_frame = 0;
         }
     }
 
@@ -4461,6 +4470,7 @@ const SHELL_MARKER_PREFIX: &str = "CATSOLLE_DONE";
 const CONNECT_ANIMATION_INTERVAL_MS: u64 = 120;
 const CONNECT_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 const SHELL_TOOL_QUEUE_MAX: usize = 8;
+const AI_PROGRESS_WIDTH: usize = 10;
 
 async fn execute_tool_call(call: ToolCall, ctx: ToolContext) -> ToolResult {
     let result = match call.name.as_str() {
@@ -4617,6 +4627,19 @@ fn connection_target(conn: &Connection) -> String {
     }
 }
 
+fn ai_progress_bar(frame: usize) -> String {
+    let mut out = String::from("[");
+    for i in 0..AI_PROGRESS_WIDTH {
+        if i == frame {
+            out.push('>');
+        } else {
+            out.push('-');
+        }
+    }
+    out.push(']');
+    out
+}
+
 fn trim_output(value: &str) -> String {
     if value.chars().count() <= TOOL_OUTPUT_LIMIT {
         return value.to_string();
@@ -4634,6 +4657,7 @@ fn tool_display_text(content: &str) -> String {
     };
     let mut lines = Vec::new();
     let is_shell = name == "remote.shell.exec";
+    let is_exec = name == "remote.exec" || name == "local.exec";
     lines.push(name);
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) {
         if is_shell {
@@ -4648,6 +4672,10 @@ fn tool_display_text(content: &str) -> String {
             if value.get("truncated").and_then(|v| v.as_bool()) == Some(true) {
                 lines.push("truncated: true".to_string());
             }
+            return lines.join("\n");
+        }
+        if is_exec {
+            push_exec_summary(&mut lines, &value);
             return lines.join("\n");
         }
         if let Some(output) = value.get("output").and_then(|v| v.as_str()) {
@@ -4683,6 +4711,43 @@ fn tool_display_text(content: &str) -> String {
     }
     lines.push(limit_tool_display(&payload));
     lines.join("\n")
+}
+
+fn push_exec_summary(lines: &mut Vec<String>, value: &serde_json::Value) {
+    if let Some(status) = value.get("status").and_then(|v| v.as_i64()) {
+        lines.push(format!("status: {status}"));
+    } else {
+        lines.push("status: unknown".to_string());
+    }
+    if let Some(output) = value.get("output").and_then(|v| v.as_str()) {
+        let (line_count, char_count) = tool_output_stats(output);
+        let summary = if output.is_empty() {
+            "output: empty".to_string()
+        } else {
+            format!("output: {line_count} lines, {char_count} chars")
+        };
+        lines.push(summary);
+    }
+    if let Some(interactive) = value.get("interactive").and_then(|v| v.as_bool()) {
+        let label = if interactive { "yes" } else { "no" };
+        lines.push(format!("interactive: {label}"));
+    }
+    if value.get("timed_out").and_then(|v| v.as_bool()) == Some(true) {
+        lines.push("timed_out: true".to_string());
+    }
+    if value.get("truncated").and_then(|v| v.as_bool()) == Some(true) {
+        lines.push("truncated: true".to_string());
+    }
+}
+
+fn tool_output_stats(output: &str) -> (usize, usize) {
+    let chars = output.chars().count();
+    let lines = if output.is_empty() {
+        0
+    } else {
+        output.lines().count()
+    };
+    (lines, chars)
 }
 
 fn split_tool_message(content: &str) -> Option<(String, String)> {
@@ -6371,9 +6436,9 @@ mod tests {
 
     #[test]
     fn tool_display_shows_output_only() {
-        let content = "Tool result (remote.exec)\n{\"output\":\"hello\\nworld\",\"status\":0}";
+        let content = "Tool result (custom.exec)\n{\"output\":\"hello\\nworld\"}";
         let rendered = tool_display_text(content);
-        assert_eq!(rendered, "remote.exec\nhello\nworld");
+        assert_eq!(rendered, "custom.exec\nhello\nworld");
     }
 
     #[test]
@@ -6431,6 +6496,23 @@ mod tests {
         let out = filter_shell_display_chunk(input.as_bytes(), token, &mut tail);
         assert_eq!(String::from_utf8(out).unwrap(), "beforeafter");
         assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn tool_display_exec_summary() {
+        let content =
+            "Tool result (remote.exec)\n{\"output\":\"ok\\n\",\"status\":0,\"interactive\":true}";
+        let rendered = tool_display_text(content);
+        assert_eq!(
+            rendered,
+            "remote.exec\nstatus: 0\noutput: 1 lines, 3 chars\ninteractive: yes"
+        );
+    }
+
+    #[test]
+    fn ai_progress_bar_renders() {
+        assert_eq!(ai_progress_bar(0), "[>---------]");
+        assert_eq!(ai_progress_bar(3), "[--->------]");
     }
 
     #[test]
